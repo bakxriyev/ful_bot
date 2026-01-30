@@ -13,11 +13,17 @@ const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 60_000 })
 
 // ===== FILE INIT =====
 if (!fs.existsSync('users.csv'))
-  fs.writeFileSync('users.csv', 'user_id,username,first_name,date\n')
+  fs.writeFileSync('users.csv', 'user_id,username,first_name,date,site_type\n')
 
-if (!fs.existsSync('start_messages.csv'))
+if (!fs.existsSync('start_messages_site1.csv'))
   fs.writeFileSync(
-    'start_messages.csv',
+    'start_messages_site1.csv',
+    'id,chat_id,message_id,delay,btn_text,btn_url\n'
+  )
+
+if (!fs.existsSync('start_messages_site2.csv'))
+  fs.writeFileSync(
+    'start_messages_site2.csv',
     'id,chat_id,message_id,delay,btn_text,btn_url\n'
   )
 
@@ -32,33 +38,50 @@ const getUsers = () =>
   fs.readFileSync('users.csv', 'utf8')
     .split('\n').slice(1).filter(Boolean)
     .map(r => {
-      const [id, username, name, date] = r.split(',')
-      return { id, username, name, date }
+      const [id, username, name, date, siteType] = r.split(',')
+      return { id, username, name, date, siteType: siteType || 'unknown' }
     })
 
-const getMessages = () =>
-  fs.readFileSync('start_messages.csv', 'utf8')
+const getMessages = (site) => {
+  const filename = `start_messages_${site}.csv`
+  if (!fs.existsSync(filename)) return []
+  
+  return fs.readFileSync(filename, 'utf8')
     .split('\n').slice(1).filter(Boolean)
     .map(r => {
       const [id, chatId, msgId, delay, btnText, btnUrl] = r.split(',')
-      return { id, chatId, msgId, delay, btnText, btnUrl }
+      return { id, chatId, msgId, delay, btnText, btnUrl, site }
     })
-
-const saveUser = u => {
-  const users = getUsers()
-  if (users.find(user => user.id === String(u.id))) return
-  
-  fs.appendFileSync(
-    'users.csv',
-    `${u.id},${u.username || ''},${u.first_name || ''},${new Date().toISOString()}\n`
-  )
 }
 
-const updateMessage = (id, field, value) => {
-  let rows = getMessages()
+const saveUser = (u, siteType) => {
+  const users = getUsers()
+  if (users.find(user => user.id === String(u.id))) {
+    // User bor, faqat site_type ni update qilamiz
+    const rows = fs.readFileSync('users.csv', 'utf8').split('\n')
+    const updatedRows = rows.map(row => {
+      const parts = row.split(',')
+      if (parts[0] === String(u.id)) {
+        parts[4] = siteType
+      }
+      return parts.join(',')
+    })
+    fs.writeFileSync('users.csv', updatedRows.join('\n'))
+  } else {
+    // Yangi user
+    fs.appendFileSync(
+      'users.csv',
+      `${u.id},${u.username || ''},${u.first_name || ''},${new Date().toISOString()},${siteType}\n`
+    )
+  }
+}
+
+const updateMessage = (site, id, field, value) => {
+  const filename = `start_messages_${site}.csv`
+  let rows = getMessages(site)
   rows = rows.map(r => r.id === id ? { ...r, [field]: value } : r)
   fs.writeFileSync(
-    'start_messages.csv',
+    filename,
     'id,chat_id,message_id,delay,btn_text,btn_url\n' +
     rows.map(r =>
       `${r.id},${r.chatId},${r.msgId},${r.delay},${r.btnText},${r.btnUrl}`
@@ -73,31 +96,50 @@ const getTodayUsers = () => {
   return getUsers().filter(u => u.date.startsWith(today))
 }
 
-const generateExcel = () => {
-  const users = getUsers()
-  const todayUsers = getTodayUsers()
+const generateExcel = (site = null) => {
+  let users = getUsers()
+  if (site) {
+    users = users.filter(u => u.siteType === site)
+  }
+  const todayUsers = getTodayUsers().filter(u => !site || u.siteType === site)
   
-  let csv = 'User ID,Username,Ism,Qo\'shilgan sana\n'
+  let csv = 'User ID,Username,Ism,Site turi,Qo\'shilgan sana\n'
   users.forEach(u => {
-    csv += `${u.id},${u.username || 'Yo\'q'},${u.name || 'Yo\'q'},${new Date(u.date).toLocaleString('uz-UZ')}\n`
+    csv += `${u.id},${u.username || 'Yo\'q'},${u.name || 'Yo\'q'},${u.siteType || 'unknown'},${new Date(u.date).toLocaleString('uz-UZ')}\n`
   })
   
   csv += `\n\nSTATISTIKA\n`
+  csv += `Site turi,${site || 'Barcha'}\n`
   csv += `Jami foydalanuvchilar,${users.length}\n`
   csv += `Bugun qo'shilganlar,${todayUsers.length}\n`
   csv += `Hisobot sanasi,${new Date().toLocaleString('uz-UZ')}\n`
   
-  const filename = `users_${Date.now()}.csv`
+  const filename = `users_${site || 'all'}_${Date.now()}.csv`
   fs.writeFileSync(filename, csv)
   return filename
 }
 
 // ===== USER START =====
 bot.start(ctx => {
-  saveUser(ctx.from)
+  const args = ctx.message.text.split(' ')
+  let siteType = 'unknown'
+  
+  if (args.length > 1) {
+    if (args[1].includes('site1')) siteType = 'site1'
+    else if (args[1].includes('site2')) siteType = 'site2'
+  }
+  
+  saveUser(ctx.from, siteType)
   const userId = ctx.from.id
 
-  getMessages().forEach(m => {
+  // Site bo'yicha xabarlarni yuborish
+  const messages = getMessages(siteType)
+  if (messages.length === 0 && siteType !== 'unknown') {
+    // Agar site uchun xabar yo'q bo'lsa, umumiy xabarlarni yuborish
+    messages.push(...getMessages('site1'), ...getMessages('site2'))
+  }
+
+  messages.forEach(m => {
     setTimeout(() => {
       bot.telegram.copyMessage(
         userId,
@@ -131,27 +173,45 @@ bot.command('admin', ctx => {
   
   admin[ctx.from.id] = { step: 'menu' }
   ctx.reply(
-    '🛠 Admin panel',
+    '🛠 Admin panel - Site tanlang',
     Markup.keyboard([
-      ['➕ Start xabar qoshish', '📋 Start xabarlar'],
+      ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+      ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
       ['📢 Hammaga xabar', '📊 Statistika'],
       ['👥 Barcha userlar', '📥 Excel yuklab olish']
     ]).resize()
   )
 })
 
-// ===== ADD START MESSAGE =====
-bot.hears('➕ Start xabar qoshish', ctx => {
+// ===== ADD START MESSAGE FOR SITE1 =====
+bot.hears('➕ Site1 xabar qoshish', ctx => {
   if (!isAdmin(ctx.from.id)) return
-  admin[ctx.from.id] = { step: 'wait_message' }
-  ctx.reply('📨 Video yoki text yuboring')
+  admin[ctx.from.id] = { step: 'wait_message', site: 'site1' }
+  ctx.reply('📨 Site1 uchun video yoki text yuboring')
 })
 
-// ===== VIEW / MANAGE START MESSAGES =====
-bot.hears('📋 Start xabarlar', async ctx => {
+// ===== ADD START MESSAGE FOR SITE2 =====
+bot.hears('➕ Site2 xabar qoshish', ctx => {
   if (!isAdmin(ctx.from.id)) return
-  const list = getMessages()
-  if (!list.length) return ctx.reply('❌ Xabar yoq')
+  admin[ctx.from.id] = { step: 'wait_message', site: 'site2' }
+  ctx.reply('📨 Site2 uchun video yoki text yuboring')
+})
+
+// ===== VIEW / MANAGE START MESSAGES FOR SITE1 =====
+bot.hears('📋 Site1 xabarlar', async ctx => {
+  if (!isAdmin(ctx.from.id)) return
+  await showMessagesList(ctx, 'site1')
+})
+
+// ===== VIEW / MANAGE START MESSAGES FOR SITE2 =====
+bot.hears('📋 Site2 xabarlar', async ctx => {
+  if (!isAdmin(ctx.from.id)) return
+  await showMessagesList(ctx, 'site2')
+})
+
+async function showMessagesList(ctx, site) {
+  const list = getMessages(site)
+  if (!list.length) return ctx.reply(`❌ ${site.toUpperCase()} uchun xabar yo'q`)
 
   for (const m of list) {
     // Xabarni o'zini ko'rsatish
@@ -170,27 +230,27 @@ bot.hears('📋 Start xabarlar', async ctx => {
 
     // Ma'lumotlar va boshqaruv tugmalari
     await ctx.reply(
-      `🆔 ID: ${m.id}\n⏱ Kechikish: ${m.delay} sekund\n🔘 Inline: ${m.btnText ? 'Bor (' + m.btnText + ')' : 'Yo\'q'}`,
+      `🏷 Site: ${site.toUpperCase()}\n🆔 ID: ${m.id}\n⏱ Kechikish: ${m.delay} sekund\n🔘 Inline: ${m.btnText ? 'Bor (' + m.btnText + ')' : 'Yo\'q'}`,
       Markup.inlineKeyboard([
         [
-          Markup.button.callback('✏️ Matnni tahrirlash', `edit_text_${m.id}`),
-          Markup.button.callback('🔄 Videoni almashtirish', `edit_video_${m.id}`)
+          Markup.button.callback('✏️ Matnni tahrirlash', `edit_text_${site}_${m.id}`),
+          Markup.button.callback('🔄 Videoni almashtirish', `edit_video_${site}_${m.id}`)
         ],
         [
-          Markup.button.callback('🔘 Inline text', `edit_btn_text_${m.id}`),
-          Markup.button.callback('🔗 Inline link', `edit_btn_url_${m.id}`)
+          Markup.button.callback('🔘 Inline text', `edit_btn_text_${site}_${m.id}`),
+          Markup.button.callback('🔗 Inline link', `edit_btn_url_${site}_${m.id}`)
         ],
         [
-          Markup.button.callback('⏱ Kechikish', `edit_delay_${m.id}`),
-          Markup.button.callback('❌ Inline o\'chirish', `inline_${m.id}`)
+          Markup.button.callback('⏱ Kechikish', `edit_delay_${site}_${m.id}`),
+          Markup.button.callback('❌ Inline o\'chirish', `inline_${site}_${m.id}`)
         ],
         [
-          Markup.button.callback('🗑 O\'chirish', `del_${m.id}`)
+          Markup.button.callback('🗑 O\'chirish', `del_${site}_${m.id}`)
         ]
       ])
     )
   }
-})
+}
 
 // ===== STATISTIKA =====
 bot.hears('📊 Statistika', async ctx => {
@@ -198,33 +258,44 @@ bot.hears('📊 Statistika', async ctx => {
   
   const users = getUsers()
   const todayUsers = getTodayUsers()
-  const startMessages = getMessages()
+  const site1Users = users.filter(u => u.siteType === 'site1')
+  const site2Users = users.filter(u => u.siteType === 'site2')
+  const unknownUsers = users.filter(u => u.siteType === 'unknown')
+  
+  const site1Messages = getMessages('site1')
+  const site2Messages = getMessages('site2')
   
   const text = `📊 Bot Statistika\n\n` +
     `👥 Jami foydalanuvchilar: ${users.length}\n` +
-    `📅 Bugun qo'shilganlar: ${todayUsers.length}\n` +
-    `📨 Start xabarlar soni: ${startMessages.length}\n` +
+    `📅 Bugun qo'shilganlar: ${todayUsers.length}\n\n` +
+    `🌐 SITE1\n` +
+    `   👤 Foydalanuvchilar: ${site1Users.length}\n` +
+    `   📨 Start xabarlar: ${site1Messages.length}\n\n` +
+    `🌐 SITE2\n` +
+    `   👤 Foydalanuvchilar: ${site2Users.length}\n` +
+    `   📨 Start xabarlar: ${site2Messages.length}\n\n` +
+    `❓ Noma'lum: ${unknownUsers.length}\n` +
     `⏰ Hozirgi vaqt: ${new Date().toLocaleString('uz-UZ')}`
   
   await ctx.reply(text)
-  
-  // Excel faylini yaratish va yuborish
-  if (users.length > 0) {
-    const filename = generateExcel()
-    await ctx.replyWithDocument({ source: filename, filename: 'users_statistika.csv' })
-    fs.unlinkSync(filename) // Faylni o'chirish
-  }
 })
 
-// ===== BARCHA USERLAR (EXCEL) =====
+// ===== BARCHA USERLAR =====
 bot.hears('👥 Barcha userlar', async ctx => {
   if (!isAdmin(ctx.from.id)) return
   
   const users = getUsers()
   if (!users.length) return ctx.reply('❌ Foydalanuvchilar yo\'q')
   
+  const site1Count = users.filter(u => u.siteType === 'site1').length
+  const site2Count = users.filter(u => u.siteType === 'site2').length
+  const unknownCount = users.filter(u => u.siteType === 'unknown').length
+  
   await ctx.reply('📊 Barcha foydalanuvchilar ma\'lumotlari:\n\n' +
     `👥 Jami: ${users.length} ta\n` +
+    `🌐 Site1: ${site1Count} ta\n` +
+    `🌐 Site2: ${site2Count} ta\n` +
+    `❓ Noma'lum: ${unknownCount} ta\n` +
     `📅 Bugun: ${getTodayUsers().length} ta`)
 })
 
@@ -235,64 +306,61 @@ bot.hears('📥 Excel yuklab olish', async ctx => {
   const users = getUsers()
   if (!users.length) return ctx.reply('❌ Foydalanuvchilar yo\'q')
   
-  const filename = generateExcel()
-  await ctx.replyWithDocument({ 
-    source: filename, 
-    filename: `users_${new Date().toLocaleDateString('uz-UZ')}.csv` 
-  })
-  fs.unlinkSync(filename)
+  await ctx.reply(
+    '📊 Excel yuklab olish',
+    Markup.keyboard([
+      ['📊 Barcha userlar', '🌐 Site1 userlar'],
+      ['🌐 Site2 userlar', '⬅️ Orqaga']
+    ]).resize()
+  )
+  admin[ctx.from.id] = { step: 'excel_choice' }
 })
 
 // ===== CALLBACKS =====
 bot.on('callback_query', async ctx => {
   if (!isAdmin(ctx.from.id)) return
   const data = ctx.callbackQuery.data
-  const id = data.split('_').pop()
-
+  
   // O'chirish
   if (data.startsWith('del_')) {
-    let rows = getMessages().filter(r => r.id !== id)
+    const [_, site, id] = data.split('_')
+    let rows = getMessages(site).filter(r => r.id !== id)
+    const filename = `start_messages_${site}.csv`
     fs.writeFileSync(
-      'start_messages.csv',
+      filename,
       'id,chat_id,message_id,delay,btn_text,btn_url\n' +
       rows.map(r =>
         `${r.id},${r.chatId},${r.msgId},${r.delay},${r.btnText},${r.btnUrl}`
       ).join('\n') + '\n'
     )
-    return ctx.answerCbQuery('🗑 Ochirildi')
+    await ctx.answerCbQuery(`🗑 ${site.toUpperCase()} uchun xabar o'chirildi`)
+    await ctx.deleteMessage()
+    return
   }
 
   // Inline o'chirish
   if (data.startsWith('inline_')) {
-    updateMessage(id, 'btnText', '')
-    updateMessage(id, 'btnUrl', '')
+    const [_, site, id] = data.split('_')
+    updateMessage(site, id, 'btnText', '')
+    updateMessage(site, id, 'btnUrl', '')
     return ctx.answerCbQuery('❌ Inline olib tashlandi')
   }
 
   // Tahrirlash buyruqlari
-  if (data.startsWith('edit_text_')) {
-    admin[ctx.from.id] = { step: 'edit_text', editId: id }
-    return ctx.reply('✏️ Yangi matnni yuboring:')
-  }
-
-  if (data.startsWith('edit_video_')) {
-    admin[ctx.from.id] = { step: 'edit_video', editId: id }
-    return ctx.reply('🔄 Yangi video yuboring:')
-  }
-
-  if (data.startsWith('edit_btn_text_')) {
-    admin[ctx.from.id] = { step: 'edit_btn_text', editId: id }
-    return ctx.reply('🔘 Yangi tugma nomini kiriting:')
-  }
-
-  if (data.startsWith('edit_btn_url_')) {
-    admin[ctx.from.id] = { step: 'edit_btn_url', editId: id }
-    return ctx.reply('🔗 Yangi linkni kiriting:')
-  }
-
-  if (data.startsWith('edit_delay_')) {
-    admin[ctx.from.id] = { step: 'edit_delay', editId: id }
-    return ctx.reply('⏱ Yangi kechikishni kiriting (sekund):')
+  const editActions = ['edit_text', 'edit_video', 'edit_btn_text', 'edit_btn_url', 'edit_delay']
+  for (const action of editActions) {
+    if (data.startsWith(`${action}_`)) {
+      const [_, site, id] = data.split('_')
+      admin[ctx.from.id] = { step: action, editId: id, editSite: site }
+      const messages = {
+        'edit_text': '✏️ Yangi matnni yuboring:',
+        'edit_video': '🔄 Yangi video yuboring:',
+        'edit_btn_text': '🔘 Yangi tugma nomini kiriting:',
+        'edit_btn_url': '🔗 Yangi linkni kiriting:',
+        'edit_delay': '⏱ Yangi kechikishni kiriting (sekund):'
+      }
+      return ctx.reply(messages[action])
+    }
   }
 })
 
@@ -300,7 +368,13 @@ bot.on('callback_query', async ctx => {
 bot.hears('📢 Hammaga xabar', ctx => {
   if (!isAdmin(ctx.from.id)) return
   admin[ctx.from.id] = { step: 'broadcast' }
-  ctx.reply('📨 Hammaga yuboriladigan xabarni jonating')
+  ctx.reply(
+    '📨 Hammaga yuboriladigan xabarni jonating',
+    Markup.keyboard([
+      ['🌐 Site1 foydalanuvchilar', '🌐 Site2 foydalanuvchilar'],
+      ['👥 Barcha foydalanuvchilar', '⬅️ Orqaga']
+    ]).resize()
+  )
 })
 
 bot.on('message', async ctx => {
@@ -321,7 +395,8 @@ bot.on('message', async ctx => {
       return ctx.reply(
         '✅ Muvaffaqiyatli kirdingiz!\n\nBuyruqlar:\n/admin - Admin panel',
         Markup.keyboard([
-          ['➕ Start xabar qoshish', '📋 Start xabarlar'],
+          ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+          ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
           ['📢 Hammaga xabar', '📊 Statistika'],
           ['👥 Barcha userlar', '📥 Excel yuklab olish']
         ]).resize()
@@ -333,6 +408,53 @@ bot.on('message', async ctx => {
 
   if (!isAdmin(userId)) return
 
+  // EXCEL CHOICE
+  if (userAdmin.step === 'excel_choice') {
+    let site = null
+    let text = ''
+    
+    if (ctx.message.text === '📊 Barcha userlar') {
+      text = '📊 Barcha foydalanuvchilar statistikasi'
+    } else if (ctx.message.text === '🌐 Site1 userlar') {
+      site = 'site1'
+      text = '🌐 Site1 foydalanuvchilar statistikasi'
+    } else if (ctx.message.text === '🌐 Site2 userlar') {
+      site = 'site2'
+      text = '🌐 Site2 foydalanuvchilar statistikasi'
+    } else if (ctx.message.text === '⬅️ Orqaga') {
+      admin[userId] = { step: 'menu' }
+      return ctx.reply(
+        '🛠 Admin panel',
+        Markup.keyboard([
+          ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+          ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
+          ['📢 Hammaga xabar', '📊 Statistika'],
+          ['👥 Barcha userlar', '📥 Excel yuklab olish']
+        ]).resize()
+      )
+    } else {
+      return ctx.reply('❌ Noto\'g\'ri tanlov')
+    }
+    
+    const filename = generateExcel(site)
+    await ctx.replyWithDocument({ 
+      source: filename, 
+      filename: `users_${site || 'all'}_${new Date().toLocaleDateString('uz-UZ')}.csv` 
+    })
+    fs.unlinkSync(filename)
+    
+    admin[userId] = { step: 'menu' }
+    return ctx.reply(
+      '🛠 Admin panel',
+      Markup.keyboard([
+        ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+        ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
+        ['📢 Hammaga xabar', '📊 Statistika'],
+        ['👥 Barcha userlar', '📥 Excel yuklab olish']
+      ]).resize()
+    )
+  }
+
   // EDIT TEXT
   if (userAdmin.step === 'edit_text') {
     if (!ctx.message.text) return ctx.reply('❌ Faqat matn yuboring')
@@ -343,7 +465,7 @@ bot.on('message', async ctx => {
       ctx.message.message_id
     )
     
-    updateMessage(userAdmin.editId, 'msgId', sent.message_id)
+    updateMessage(userAdmin.editSite, userAdmin.editId, 'msgId', sent.message_id)
     delete admin[userId]
     return ctx.reply('✅ Matn yangilandi!')
   }
@@ -360,21 +482,21 @@ bot.on('message', async ctx => {
       ctx.message.message_id
     )
     
-    updateMessage(userAdmin.editId, 'msgId', sent.message_id)
+    updateMessage(userAdmin.editSite, userAdmin.editId, 'msgId', sent.message_id)
     delete admin[userId]
     return ctx.reply('✅ Media yangilandi!')
   }
 
   // EDIT BUTTON TEXT
   if (userAdmin.step === 'edit_btn_text') {
-    updateMessage(userAdmin.editId, 'btnText', ctx.message.text)
+    updateMessage(userAdmin.editSite, userAdmin.editId, 'btnText', ctx.message.text)
     delete admin[userId]
     return ctx.reply('✅ Tugma nomi yangilandi!')
   }
 
   // EDIT BUTTON URL
   if (userAdmin.step === 'edit_btn_url') {
-    updateMessage(userAdmin.editId, 'btnUrl', ctx.message.text)
+    updateMessage(userAdmin.editSite, userAdmin.editId, 'btnUrl', ctx.message.text)
     delete admin[userId]
     return ctx.reply('✅ Tugma linki yangilandi!')
   }
@@ -384,7 +506,7 @@ bot.on('message', async ctx => {
     const delay = Number(ctx.message.text)
     if (isNaN(delay)) return ctx.reply('❌ Raqam kiriting')
     
-    updateMessage(userAdmin.editId, 'delay', delay)
+    updateMessage(userAdmin.editSite, userAdmin.editId, 'delay', delay)
     delete admin[userId]
     return ctx.reply('✅ Kechikish yangilandi!')
   }
@@ -396,9 +518,14 @@ bot.on('message', async ctx => {
       ctx.chat.id,
       ctx.message.message_id
     )
-    admin[userId] = { ...userAdmin, msgId: sent.message_id, step: 'ask_inline' }
+    admin[userId] = { 
+      ...userAdmin, 
+      msgId: sent.message_id, 
+      step: 'ask_inline',
+      chatId: CHANNEL_ID
+    }
     return ctx.reply(
-      '🔘 Inline keyboard qoshilsinmi?',
+      `🔘 Inline keyboard qo'shilsinmi? (${userAdmin.site.toUpperCase()})`,
       Markup.keyboard([['Ha'], ['Yoq']]).resize()
     )
   }
@@ -426,28 +553,71 @@ bot.on('message', async ctx => {
     const delay = Number(ctx.message.text)
     if (isNaN(delay)) return ctx.reply('❌ Raqam kiriting')
 
+    const filename = `start_messages_${userAdmin.site}.csv`
     fs.appendFileSync(
-      'start_messages.csv',
-      `${Date.now()},${CHANNEL_ID},${userAdmin.msgId},${delay},${userAdmin.btnText || ''},${userAdmin.btnUrl || ''}\n`
+      filename,
+      `${Date.now()},${userAdmin.chatId},${userAdmin.msgId},${delay},${userAdmin.btnText || ''},${userAdmin.btnUrl || ''}\n`
     )
 
     admin[userId] = { step: 'menu' }
-    return ctx.reply('✅ Start xabar saqlandi', 
+    return ctx.reply(`✅ ${userAdmin.site.toUpperCase()} uchun start xabar saqlandi!`,
       Markup.keyboard([
-        ['➕ Start xabar qoshish', '📋 Start xabarlar'],
+        ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+        ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
         ['📢 Hammaga xabar', '📊 Statistika'],
         ['👥 Barcha userlar', '📥 Excel yuklab olish']
       ]).resize()
     )
   }
 
-  // BROADCAST
+  // BROADCAST CHOICE
   if (userAdmin.step === 'broadcast') {
-    const users = getUsers()
+    if (ctx.message.text === '🌐 Site1 foydalanuvchilar') {
+      admin[userId] = { ...userAdmin, step: 'broadcast_send', targetSite: 'site1' }
+      return ctx.reply('📨 Site1 foydalanuvchilariga yuboriladigan xabarni yuboring')
+    } else if (ctx.message.text === '🌐 Site2 foydalanuvchilar') {
+      admin[userId] = { ...userAdmin, step: 'broadcast_send', targetSite: 'site2' }
+      return ctx.reply('📨 Site2 foydalanuvchilariga yuboriladigan xabarni yuboring')
+    } else if (ctx.message.text === '👥 Barcha foydalanuvchilar') {
+      admin[userId] = { ...userAdmin, step: 'broadcast_send', targetSite: 'all' }
+      return ctx.reply('📨 Barcha foydalanuvchilarga yuboriladigan xabarni yuboring')
+    } else if (ctx.message.text === '⬅️ Orqaga') {
+      admin[userId] = { step: 'menu' }
+      return ctx.reply(
+        '🛠 Admin panel',
+        Markup.keyboard([
+          ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+          ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
+          ['📢 Hammaga xabar', '📊 Statistika'],
+          ['👥 Barcha userlar', '📥 Excel yuklab olish']
+        ]).resize()
+      )
+    }
+  }
+
+  // BROADCAST SEND
+  if (userAdmin.step === 'broadcast_send') {
+    let users = getUsers()
+    if (userAdmin.targetSite !== 'all') {
+      users = users.filter(u => u.siteType === userAdmin.targetSite)
+    }
+    
+    if (!users.length) {
+      admin[userId] = { step: 'menu' }
+      return ctx.reply('❌ Tanlangan guruhda foydalanuvchi yo\'q',
+        Markup.keyboard([
+          ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+          ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
+          ['📢 Hammaga xabar', '📊 Statistika'],
+          ['👥 Barcha userlar', '📥 Excel yuklab olish']
+        ]).resize()
+      )
+    }
+    
     let success = 0
     let failed = 0
     
-    const statusMsg = await ctx.reply('📤 Yuborilmoqda...')
+    const statusMsg = await ctx.reply(`📤 Yuborilmoqda...\n\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\nJami: ${users.length}`)
     
     for (const u of users) {
       const result = await bot.telegram.copyMessage(
@@ -464,7 +634,7 @@ bot.on('message', async ctx => {
           ctx.chat.id,
           statusMsg.message_id,
           null,
-          `📤 Yuborilmoqda...\n\n✅ Yuborildi: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
+          `📤 Yuborilmoqda...\n\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Yuborildi: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
         ).catch(() => {})
       }
     }
@@ -474,7 +644,17 @@ bot.on('message', async ctx => {
       ctx.chat.id,
       statusMsg.message_id,
       null,
-      `✅ Xabar yuborish tugadi!\n\n📊 Statistika:\n✅ Muvaffaqiyatli: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
+      `✅ Xabar yuborish tugadi!\n\n📊 Statistika:\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Muvaffaqiyatli: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
+    )
+    
+    return ctx.reply(
+      '🛠 Admin panel',
+      Markup.keyboard([
+        ['➕ Site1 xabar qoshish', '📋 Site1 xabarlar'],
+        ['➕ Site2 xabar qoshish', '📋 Site2 xabarlar'],
+        ['📢 Hammaga xabar', '📊 Statistika'],
+        ['👥 Barcha userlar', '📥 Excel yuklab olish']
+      ]).resize()
     )
   }
 })
@@ -485,3 +665,7 @@ console.log('🚀 BOT ISHLAYAPTI')
 console.log('👤 Login: ' + ADMIN_LOGIN)
 console.log('🔐 Parol: ' + ADMIN_PASSWORD)
 console.log('\n📝 Admin bo\'lish uchun: /login')
+console.log('\n🌐 Saytlar uchun start komandalari:')
+console.log('/start=site1 - Site1 uchun start')
+console.log('/start=site2 - Site2 uchun start')
+console.log('/start - Oddiy start')
