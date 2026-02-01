@@ -56,7 +56,9 @@ const getMessages = (site) => {
 
 const saveUser = (u, siteType) => {
   const users = getUsers()
-  if (users.find(user => user.id === String(u.id))) {
+  const existingUser = users.find(user => user.id === String(u.id))
+  
+  if (existingUser) {
     // User bor, faqat site_type ni update qilamiz
     const rows = fs.readFileSync('users.csv', 'utf8').split('\n')
     const updatedRows = rows.map(row => {
@@ -74,6 +76,38 @@ const saveUser = (u, siteType) => {
       `${u.id},${u.username || ''},${u.first_name || ''},${new Date().toISOString()},${siteType}\n`
     )
   }
+  
+  // Har safar user bor-yo'qligidan qat'i nazar, true qaytaramiz
+  return true
+}
+
+const sendMessagesToUser = (userId, siteType) => {
+  const messages = getMessages(siteType)
+  
+  // Agar site uchun xabar yo'q bo'lsa, boshqa site'lardan xabar olish
+  if (messages.length === 0 && siteType !== 'unknown') {
+    messages.push(...getMessages('site1'), ...getMessages('site2'))
+  }
+  
+  // Barcha xabarlarni yuborish
+  messages.forEach(m => {
+    setTimeout(() => {
+      bot.telegram.copyMessage(
+        userId,
+        m.chatId,
+        m.msgId,
+        m.btnText ? {
+          reply_markup: {
+            inline_keyboard: [[{ text: m.btnText, url: m.btnUrl }]]
+          }
+        } : {}
+      ).catch(err => {
+        console.error('Xabar yuborishda xatolik:', err.message)
+      })
+    }, Number(m.delay) * 1000)
+  })
+  
+  return messages.length
 }
 
 const updateMessage = (site, id, field, value) => {
@@ -129,30 +163,13 @@ bot.start(ctx => {
     else if (args[1].includes('site2')) siteType = 'site2'
   }
   
+  // Foydalanuvchini saqlash va xabarlarni yuborish
   saveUser(ctx.from, siteType)
-  const userId = ctx.from.id
-
-  // Site bo'yicha xabarlarni yuborish
-  const messages = getMessages(siteType)
-  if (messages.length === 0 && siteType !== 'unknown') {
-    // Agar site uchun xabar yo'q bo'lsa, umumiy xabarlarni yuborish
-    messages.push(...getMessages('site1'), ...getMessages('site2'))
+  const messagesSent = sendMessagesToUser(ctx.from.id, siteType)
+  
+  if (messagesSent === 0) {
+    ctx.reply('Botimizga xush kelibsiz!')
   }
-
-  messages.forEach(m => {
-    setTimeout(() => {
-      bot.telegram.copyMessage(
-        userId,
-        m.chatId,
-        m.msgId,
-        m.btnText ? {
-          reply_markup: {
-            inline_keyboard: [[{ text: m.btnText, url: m.btnUrl }]]
-          }
-        } : {}
-      ).catch(() => {})
-    }, Number(m.delay) * 1000)
-  })
 })
 
 // ===== ADMIN LOGIN =====
@@ -226,7 +243,9 @@ async function showMessagesList(ctx, site) {
           }
         } : {}
       )
-    } catch (e) {}
+    } catch (e) {
+      console.error('Xabarni ko\'rsatishda xatolik:', e.message)
+    }
 
     // Ma'lumotlar va boshqaruv tugmalari
     await ctx.reply(
@@ -620,32 +639,41 @@ bot.on('message', async ctx => {
     const statusMsg = await ctx.reply(`📤 Yuborilmoqda...\n\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\nJami: ${users.length}`)
     
     for (const u of users) {
-      const result = await bot.telegram.copyMessage(
-        u.id,
-        ctx.chat.id,
-        ctx.message.message_id
-      ).catch(() => null)
-      
-      if (result) success++
-      else failed++
+      try {
+        await bot.telegram.copyMessage(
+          u.id,
+          ctx.chat.id,
+          ctx.message.message_id
+        )
+        success++
+      } catch (error) {
+        failed++
+      }
       
       if ((success + failed) % 10 === 0) {
-        await bot.telegram.editMessageText(
-          ctx.chat.id,
-          statusMsg.message_id,
-          null,
-          `📤 Yuborilmoqda...\n\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Yuborildi: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
-        ).catch(() => {})
+        try {
+          await bot.telegram.editMessageText(
+            ctx.chat.id,
+            statusMsg.message_id,
+            null,
+            `📤 Yuborilmoqda...\n\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Yuborildi: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
+          )
+        } catch (e) {}
       }
+      
+      // Spam qilmaslik uchun biroz kutamiz
+      await new Promise(resolve => setTimeout(resolve, 50))
     }
     
     admin[userId] = { step: 'menu' }
-    await bot.telegram.editMessageText(
-      ctx.chat.id,
-      statusMsg.message_id,
-      null,
-      `✅ Xabar yuborish tugadi!\n\n📊 Statistika:\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Muvaffaqiyatli: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
-    )
+    try {
+      await bot.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        null,
+        `✅ Xabar yuborish tugadi!\n\n📊 Statistika:\nGuruh: ${userAdmin.targetSite === 'all' ? 'Barcha' : userAdmin.targetSite.toUpperCase()}\n✅ Muvaffaqiyatli: ${success}\n❌ Xatolik: ${failed}\n📊 Jami: ${users.length}`
+      )
+    } catch (e) {}
     
     return ctx.reply(
       '🛠 Admin panel',
@@ -669,3 +697,6 @@ console.log('\n🌐 Saytlar uchun start komandalari:')
 console.log('/start=site1 - Site1 uchun start')
 console.log('/start=site2 - Site2 uchun start')
 console.log('/start - Oddiy start')
+
+process.once('SIGINT', () => bot.stop('SIGINT'))
+process.once('SIGTERM', () => bot.stop('SIGTERM'))
