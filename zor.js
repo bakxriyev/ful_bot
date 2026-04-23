@@ -10,7 +10,7 @@ const ADMIN_LOGIN = 'admin'
 const ADMIN_PASSWORD = 'admin123'
 
 const CHANNEL_ID = '@botbazaiman'
-const EXCEL_INTERVAL_MINUTES = 1
+const EXCEL_INTERVAL_MINUTES = 10
 
 const USERS_CSV     = path.join(__dirname, 'users.csv')
 const MESSAGES_JSON = path.join(__dirname, 'start_messages.json')
@@ -308,6 +308,68 @@ const safeDeleteTempFile = filepath => {
   } catch {}
 }
 
+// ===== NON-BLOCKING BROADCAST QUEUE =====
+// Broadcast bot'ni qotirmasligi uchun background'da ishlaydi.
+// Har bir xabar orasida setImmediate → event loop bo'shashadi →
+// boshqa /start, admin buyruqlari ishlayveradi.
+
+const broadcastQueue = [] // { users, chatId, msgId, fromChatId, stMsgId, resolve }
+let broadcastRunning = false
+
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+const runBroadcastQueue = async () => {
+  if (broadcastRunning) return
+  broadcastRunning = true
+  while (broadcastQueue.length > 0) {
+    const job = broadcastQueue.shift()
+    await processBroadcastJob(job)
+  }
+  broadcastRunning = false
+}
+
+const processBroadcastJob = async (job) => {
+  const { users, fromChatId, msgId, stMsgId, chatId } = job
+  let ok = 0, err = 0
+  const total = users.length
+
+  for (let i = 0; i < users.length; i++) {
+    const u = users[i]
+    try {
+      await bot.telegram.copyMessage(u.id, fromChatId, msgId)
+      ok++
+    } catch {
+      err++
+    }
+
+    const done = ok + err
+
+    // Har 20 ta da progress yangilash
+    if (done % 20 === 0 || done === total) {
+      try {
+        await bot.telegram.editMessageText(
+          chatId, stMsgId, null,
+          `📤 ${done}/${total} (✅${ok} ❌${err})`
+        )
+      } catch {}
+    }
+
+    // Event loop'ni bo'shatish uchun — bu asosiy trick
+    // setImmediate boshqa pending callbacklarni ishlashiga ruxsat beradi
+    await new Promise(r => setImmediate(r))
+
+    // Telegram rate limit: 30 msg/sec, bir oz kutish
+    if (i % 30 === 29) await sleep(1000)
+  }
+
+  try {
+    await bot.telegram.editMessageText(
+      chatId, stMsgId, null,
+      `✅ Broadcast tugadi!\n📤 Jami: ${total}\n✅ Muvaffaqiyatli: ${ok}\n❌ Xatolik: ${err}`
+    )
+  } catch {}
+}
+
 // ===== ADMIN STATE =====
 const adminState = {}
 
@@ -418,7 +480,7 @@ setInterval(() => {
 // ===== /start =====
 bot.start(async ctx => {
   try {
-    const args = ctx.message.text.split(' ')
+    const args = (ctx.message.text || '').split(' ')
     let site = 'default'
     if (args[1]?.toLowerCase().includes('site1')) site = 'site1'
     else if (args[1]?.toLowerCase().includes('site2')) site = 'site2'
@@ -559,7 +621,7 @@ bot.on('callback_query', async ctx => {
 bot.on('message', async ctx => {
   const uid   = ctx.from.id
   const state = adminState[uid]
-  const txt   = ctx.message.text
+  const txt   = ctx.message.text || ctx.message.caption || ''
 
   // --- Broadcast tugmasi ---
   if (txt === '📢 Hammaga xabar' && isAdmin(uid)) {
@@ -686,48 +748,36 @@ bot.on('message', async ctx => {
   }
 
   if (state?.step === 'broadcast_send') {
-    try {
-      let allUsers = getUsers()
-      const targetUsers = state.target === 'all' ? allUsers : allUsers.filter(u => u.siteType === state.target)
+    const allUsers = getUsers()
+    const targetUsers = state.target === 'all' ? allUsers : allUsers.filter(u => u.siteType === state.target)
 
-      if (!targetUsers.length) {
-        delete adminState[uid]
-        return ctx.reply('❌ Foydalanuvchi topilmadi', adminKeyboard())
-      }
-
-      const stMsg = await ctx.reply(`📤 Jo'natilmoqda: 0/${targetUsers.length}`)
-      let ok = 0, err = 0
-
-      for (const u of targetUsers) {
-        try {
-          await ctx.telegram.copyMessage(u.id, ctx.chat.id, ctx.message.message_id)
-          ok++
-        } catch (e) {
-          err++
-        }
-        const done = ok + err
-        if (done % 10 === 0 || done === targetUsers.length) {
-          try {
-            await ctx.telegram.editMessageText(
-              ctx.chat.id, stMsg.message_id, null,
-              `📤 ${done}/${targetUsers.length} (✅${ok} ❌${err})`
-            )
-          } catch {}
-        }
-        await new Promise(r => setTimeout(r, 35))
-      }
-
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, stMsg.message_id, null,
-        `✅ Broadcast tugadi!\n📤 Jami: ${targetUsers.length}\n✅ Muvaffaqiyatli: ${ok}\n❌ Xatolik: ${err}`
-      )
-    } catch (e) {
-      console.error('Broadcast xatosi:', e.message)
-      await ctx.reply('❌ Broadcast xatosi')
+    if (!targetUsers.length) {
+      delete adminState[uid]
+      return ctx.reply('❌ Foydalanuvchi topilmadi', adminKeyboard())
     }
+
+    // Progress xabari
+    const stMsg = await ctx.reply(`📤 Navbatga qo'shildi: 0/${targetUsers.length}\n⏳ Broadcast background'da ishlaydi...`)
+
+    // Navbatga qo'shish — await YO'Q, bot bloklanmaydi!
+    broadcastQueue.push({
+      users:      targetUsers,
+      fromChatId: ctx.chat.id,
+      msgId:      ctx.message.message_id,
+      chatId:     ctx.chat.id,
+      stMsgId:    stMsg.message_id
+    })
+    runBroadcastQueue() // fire-and-forget
+
     delete adminState[uid]
-    return ctx.reply('Bajarildi ✅', adminKeyboard())
+    return ctx.reply(`✅ Broadcast boshlandi!\nBot bloklanmaydi — boshqalar /start bosa oladi.\n📊 Progressni yuqoridagi xabarda kuzating.`, adminKeyboard())
   }
+})
+
+// ===== GLOBAL XATO TUTISH =====
+bot.catch((err, ctx) => {
+  console.error('Bot xatosi:', err?.message || err)
+  // foydalanuvchiga xabar bermaslik — shunchaki log
 })
 
 // ===== ISHGA TUSHIRISH =====
