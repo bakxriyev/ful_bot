@@ -717,7 +717,7 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const BOT_TOKEN = '8536141927:AAF9dooLSHGxZRBLqV_o3uAPsIZ9jl5v6Js'
+const BOT_TOKEN = '8783455246:AAEnWJ8rUj5ubulU0wemIEtdV53xgaWhE5E'
 const ADMIN_LOGIN = 'admin'
 const ADMIN_PASSWORD = 'admin123'
 
