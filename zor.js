@@ -717,13 +717,13 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const BOT_TOKEN = '8783455246:AAEnWJ8rUj5ubulU0wemIEtdV53xgaWhE5E'
+const BOT_TOKEN = '8536141927:AAF9dooLSHGxZRBLqV_o3uAPsIZ9jl5v6Js'
 const ADMIN_LOGIN = 'admin'
 const ADMIN_PASSWORD = 'admin123'
 
-// --- YANGI QO‘SHIMCHA: KANAL ID'SI (O'zingiznikiga o'zgartiring) ---
-const CHANNEL_ID = '@botbazaiman' // yoki -1001234567890 raqamli ID
-const EXCEL_INTERVAL_MINUTES = 30 // har 30 daqiqada yuboriladi
+// --- Kanalingiz ID sini kiriting ( @username yoki -100123456789 ) ---
+const CHANNEL_ID = '@botbazaiman'
+const EXCEL_INTERVAL_MINUTES = 1
 
 const USERS_CSV     = path.join(__dirname, 'users.csv')
 const MESSAGES_JSON = path.join(__dirname, 'start_messages.json')
@@ -732,7 +732,7 @@ const TEMP_DIR      = path.join(__dirname, 'temp_exports')
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true })
 
-// ===== Fayllarni yaratish (faqat yo‘q bo‘lsa) =====
+// ===== Fayllarni yaratish =====
 if (!fs.existsSync(USERS_CSV)) {
   fs.writeFileSync(USERS_CSV, 'user_id,username,first_name,start_date,site_type\n', 'utf8')
 }
@@ -760,7 +760,7 @@ const readStartMessages = () => {
 }
 const writeStartMessages = data => fs.writeFileSync(MESSAGES_JSON, JSON.stringify(data, null, 2), 'utf8')
 
-// ===== FOYDALANUVCHILARNI O‘QISH =====
+// ===== FOYDALANUVCHILARNI O‘QISH (vergulli sanani to‘g‘ri ajratadi) =====
 const getUsers = () => {
   try {
     const content = fs.readFileSync(USERS_CSV, 'utf8')
@@ -768,6 +768,7 @@ const getUsers = () => {
     const dataLines = lines.length > 0 && lines[0].startsWith('user_id') ? lines.slice(1) : lines
 
     return dataLines.map(line => {
+      // 4 ta vergul – keyin sana (ichida vergul bo‘lishi mumkin)
       const parts = line.split(',').map(p => p.trim())
       if (parts.length < 4) return null
 
@@ -775,9 +776,9 @@ const getUsers = () => {
       const username = parts[1]
       const name = parts[2]
       const siteTypeRaw = parts[3]
-      let dateRaw = parts.slice(4).join(',').trim()
-      let dateISO = ''
+      const dateRaw = parts.slice(4).join(',').trim()
 
+      let dateISO = ''
       if (dateRaw) {
         const match = dateRaw.match(/(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s*(\d{1,2}):(\d{2}):(\d{2})/)
         if (match) {
@@ -790,12 +791,11 @@ const getUsers = () => {
         }
       }
 
-      let siteType = siteTypeRaw || 'unknown'
-      if (siteType === 'site1' || siteType === 'site2' || siteType === 'default') {
-        // good
-      } else if (siteType.toLowerCase() === 'site1') siteType = 'site1'
-      else if (siteType.toLowerCase() === 'site2') siteType = 'site2'
-      else if (siteType.toLowerCase() === 'default' || siteType === 'Oddiy start') siteType = 'default'
+      let siteType = siteTypeRaw
+      if (!siteType || siteType === '') siteType = 'unknown'
+      else if (siteType === 'default' || siteType === 'Oddiy start') siteType = 'default'
+      else if (siteType === 'site1' || siteType === 'Site1') siteType = 'site1'
+      else if (siteType === 'site2' || siteType === 'Site2') siteType = 'site2'
 
       return { id, username, name, date: dateISO, siteType }
     }).filter(u => u && u.id)
@@ -822,8 +822,8 @@ const writeUsers = (users) => {
 const saveUser = (user, siteType) => {
   try {
     let users = getUsers()
-    if (users === null) {
-      console.error('❌ getUsers muvaffaqiyatsiz, faylga tegmadik!')
+    if (!users) {
+      console.error('❌ getUsers null qaytardi, faylga tegmadik')
       return
     }
     const existing = users.find(u => u.id === String(user.id))
@@ -850,36 +850,56 @@ const saveUser = (user, siteType) => {
 
 const getTodayUsers = () => {
   const today = new Date().toISOString().split('T')[0]
-  return getUsers()?.filter(u => u.date.startsWith(today)) || []
+  const users = getUsers()
+  return users ? users.filter(u => u.date.startsWith(today)) : []
 }
 
-// ===== Export (Excel uchun) =====
+// ===== SANANI ASL FORMATGA O‘GIRISH (dd/mm/yyyy, hh:mm:ss) =====
+const formatDateForExport = (isoString) => {
+  try {
+    const d = new Date(isoString)
+    const opts = { timeZone: 'Asia/Tashkent', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }
+    const parts = d.toLocaleString('en-GB', opts).split(', ')
+    // parts[0] = 'dd/mm/yyyy', parts[1] = 'hh:mm:ss'
+    // Bazi brauzer/environment format farq qilishi mumkin, qo'lda tuzamiz
+    const date = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`
+    const time = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`
+    return `${date}, ${time}`
+  } catch {
+    return isoString
+  }
+}
+
+// ===== EXPORT CSV (siz ko‘rsatgan formatda) =====
 const generateExportCSV = (siteType = null) => {
   try {
     const users = getUsers()
     if (!users) return null
     const filtered = siteType ? users.filter(u => u.siteType === siteType) : users
-    const today = new Date().toISOString().split('T')[0]
-    const todayCount = filtered.filter(u => u.date.startsWith(today)).length
 
+    const today = new Date().toISOString().split('T')[0]
+    const todayCount = filtered.filter(u => u.date && u.date.startsWith(today)).length
+
+    // BOM qo‘shamiz
     let csv = '\uFEFF'
-    csv += 'User ID,Username,Ism,Site turi,Qo\'shilgan sana (ISO),Qo\'shilgan sana (O\'zbek)\n'
+    // Sarlavha
+    csv += 'User ID,Username,Ism,Site turi,Qo\'shilgan sana\n'
+
     filtered.forEach(u => {
-      let uzDate = ''
-      try {
-        uzDate = new Date(u.date).toLocaleString('uz-UZ', {
-          timeZone: 'Asia/Tashkent',
-          year: 'numeric', month: '2-digit', day: '2-digit',
-          hour: '2-digit', minute: '2-digit', second: '2-digit'
-        })
-      } catch { uzDate = u.date }
-      const siteName = u.siteType === 'site1' ? 'Site1' :
-                       u.siteType === 'site2' ? 'Site2' :
-                       u.siteType === 'default' ? 'Oddiy start' : 'Noma\'lum'
-      csv += `${u.id},${u.username || 'Yo\'q'},${u.name || 'Yo\'q'},${siteName},${u.date},${uzDate}\n`
+      const dateFormatted = formatDateForExport(u.date)
+      csv += `${u.id},${u.username || 'Yo\'q'},${u.name || 'Yo\'q'},${u.siteType},${dateFormatted}\n`
     })
 
-    csv += `\nSTATISTIKA\nSayt turi,${siteType ? (siteType === 'default' ? 'Oddiy start' : siteType.toUpperCase()) : 'Barcha'}\nJami foydalanuvchilar,${filtered.length}\nBugun qo'shilganlar,${todayCount}\nHisobot sanasi,${new Date().toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })}\n`
+    // STATISTIKA bo‘limi
+    csv += `\nSTATISTIKA\n`
+    csv += `Sayt turi,${siteType ? (siteType === 'default' ? 'default' : siteType) : 'Barcha'}\n`
+    csv += `Jami foydalanuvchilar,${filtered.length}\n`
+    csv += `Bugun qo'shilganlar,${todayCount}\n`
+
+    // Hisobot sanasi: hozirgi Toshkent vaqti, xuddi namunadagi formatda
+    const now = new Date()
+    const hisobotSana = formatDateForExport(now.toISOString())
+    csv += `Hisobot sanasi,${hisobotSana}\n`
 
     const filename = path.join(TEMP_DIR, `export_${siteType || 'all'}_${Date.now()}.csv`)
     fs.writeFileSync(filename, csv, 'utf8')
@@ -963,20 +983,14 @@ const sendDailyReport = async () => {
   } catch (e) { console.error('Kunlik hisobot xatosi:', e) }
 }
 
-// --- YANGI QO‘SHIMCHA: Har 30 daqiqada kanalga Excel yuborish ---
+// ===== Kanalga avtomatik Excel yuborish =====
 const sendExcelToChannel = async () => {
   try {
     const users = getUsers()
-    if (!users || users.length === 0) {
-      console.log('⏰ Foydalanuvchilar yo‘q, Excel yuborilmadi.')
-      return
-    }
+    if (!users || users.length === 0) return
 
-    const filePath = generateExportCSV(null) // barcha foydalanuvchilar
-    if (!filePath) {
-      console.error('❌ Excel fayl yaratilmadi')
-      return
-    }
+    const filePath = generateExportCSV(null)
+    if (!filePath) return
 
     const now = new Date().toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent' })
     const caption = `📊 Avtomatik hisobot (har ${EXCEL_INTERVAL_MINUTES} daqiqa)\n👥 Jami foydalanuvchilar: ${users.length}\n📅 Sana: ${now}`
@@ -986,20 +1000,16 @@ const sendExcelToChannel = async () => {
       { source: filePath, filename: `users_report_${Date.now()}.csv` },
       { caption }
     )
-
-    console.log(`✅ Kanalga Excel yuborildi (${users.length} ta foydalanuvchi)`)
+    console.log(`✅ Kanalga Excel yuborildi (${users.length} ta)`)
     safeDeleteTempFile(filePath)
   } catch (e) {
     console.error('❌ Kanalga yuborishda xatolik:', e.message)
   }
 }
 
-// Har EXCEL_INTERVAL_MINUTES daqiqada kanalga yuborish
-setInterval(() => {
-  sendExcelToChannel()
-}, EXCEL_INTERVAL_MINUTES * 60 * 1000)
+setInterval(sendExcelToChannel, EXCEL_INTERVAL_MINUTES * 60 * 1000)
 
-// Kunlik hisobot uchun Toshkent 00:00 tekshiruvi (avvalgidek)
+// Kunlik hisobot Toshkent 00:00
 let lastSentDate = ''
 setInterval(() => {
   const n = new Date()
@@ -1026,7 +1036,7 @@ bot.start(async ctx => {
   } catch {}
 })
 
-// ===== Login/Logout =====
+// ===== Login/Logout/Admin =====
 bot.command('login', ctx => { adminState[ctx.from.id] = { step: 'login' }; ctx.reply('👤 Login kiriting:') })
 bot.command('logout', ctx => {
   sessions[String(ctx.from.id)] = false; saveSession(); ctx.reply('👋 Tizimdan chiqdingiz')
@@ -1078,6 +1088,7 @@ bot.hears('➕ Oddiy start xabar', ctx => startAddMessage(ctx, 'default'))
 bot.hears('📋 Site1 xabarlar', ctx => showMessagesList(ctx, 'site1'))
 bot.hears('📋 Site2 xabarlar', ctx => showMessagesList(ctx, 'site2'))
 bot.hears('📋 Oddiy start xabarlar', ctx => showMessagesList(ctx, 'default'))
+
 bot.hears('📊 Statistika', async ctx => {
   if (!isAdmin(ctx.from.id)) return
   const users = getUsers()
@@ -1087,15 +1098,21 @@ bot.hears('📊 Statistika', async ctx => {
   const site1 = users.filter(u => u.siteType === 'site1').length
   const site2 = users.filter(u => u.siteType === 'site2').length
   const def = users.filter(u => u.siteType === 'default').length
-  const unk = users.filter(u => u.siteType === 'unknown').length
-  await ctx.reply(`📊 ${users.length} ta, Bugun: ${today}\nSite1: ${site1} (${msgs.site1.length})\nSite2: ${site2} (${msgs.site2.length})\nOddiy start: ${def} (${msgs.default.length})\nNoma'lum: ${unk}`)
+  const unknown = users.filter(u => u.siteType === 'unknown').length
+  await ctx.reply(`📊 Jami: ${users.length}\n📅 Bugun: ${today}\n\n🌐 Site1: ${site1} (xabarlar: ${msgs.site1.length})\n🌐 Site2: ${site2} (xabarlar: ${msgs.site2.length})\n🟢 Oddiy start: ${def} (xabarlar: ${msgs.default.length})\n❓ Noma'lum: ${unknown}`)
 })
+
 bot.hears('👥 Barcha userlar', ctx => {
   if (!isAdmin(ctx.from.id)) return
-  const u = getUsers()
-  if (!u) return
-  ctx.reply(`👥 Jami: ${u.length}\nSite1: ${u.filter(x => x.siteType === 'site1').length}\nSite2: ${u.filter(x => x.siteType === 'site2').length}\nOddiy start: ${u.filter(x => x.siteType === 'default').length}\nNoma'lum: ${u.filter(x => x.siteType === 'unknown').length}\nBugun: ${getTodayUsers().length}`)
+  const users = getUsers()
+  if (!users) return ctx.reply('Xatolik')
+  const site1 = users.filter(u => u.siteType === 'site1').length
+  const site2 = users.filter(u => u.siteType === 'site2').length
+  const def = users.filter(u => u.siteType === 'default').length
+  const unknown = users.filter(u => u.siteType === 'unknown').length
+  ctx.reply(`👥 Jami: ${users.length}\n🌐 Site1: ${site1}\n🌐 Site2: ${site2}\n🟢 Oddiy start: ${def}\n❓ Noma'lum: ${unknown}\n📅 Bugun: ${getTodayUsers().length}`)
 })
+
 bot.hears('📥 Excel yuklab olish', ctx => {
   if (!isAdmin(ctx.from.id)) return
   adminState[ctx.from.id] = { step: 'excel_choice' }
@@ -1174,6 +1191,7 @@ bot.on('message', async ctx => {
     delete adminState[uid]; return ctx.reply('✅', adminKeyboard())
   }
 
+  // Media qo‘shish bosqichlari (avvalgidek, o‘zgartirilmagan)
   if (state?.step === 'wait_media') {
     const site = state.site
     if (txt === '/skip') { adminState[uid] = { step: 'wait_text', site, media_type: 'text' }; return ctx.reply('Matn yuboring:') }
@@ -1216,6 +1234,7 @@ bot.on('message', async ctx => {
     return ctx.reply(`✅ ${state.site === 'default' ? 'Oddiy start' : state.site.toUpperCase()} uchun xabar qo'shildi`, adminKeyboard())
   }
 
+  // Tahrirlash
   if (state?.step?.startsWith('edit_')) {
     const field = state.step.replace('edit_', '')
     const all = readStartMessages(); const msgs = all[state.site] || []; const m = msgs.find(x => x.id === state.id)
@@ -1234,6 +1253,7 @@ bot.on('message', async ctx => {
     } catch { delete adminState[uid]; return ctx.reply('Xatolik', adminKeyboard()) }
   }
 
+  // Broadcast
   if (state?.step === 'broadcast_target') {
     let target = null
     if (txt === '🌐 Site1') target = 'site1'
@@ -1245,7 +1265,6 @@ bot.on('message', async ctx => {
     adminState[uid] = { step: 'broadcast_send', target }
     return ctx.reply('Yuboriladigan xabarni yuboring:')
   }
-
   if (state?.step === 'broadcast_send') {
     try {
       let users = getUsers()
@@ -1272,10 +1291,12 @@ bot.launch({ dropPendingUpdates: true }).then(() => {
   console.log('🚀 BOT ISHLAYAPTI')
   console.log(`👤 Login: ${ADMIN_LOGIN}  🔐 Parol: ${ADMIN_PASSWORD}`)
   console.log(`📁 Baza: ${USERS_CSV}`)
-  console.log(`📁 Temp: ${TEMP_DIR}`)
-  console.log(`📡 Kanal: ${CHANNEL_ID} ga har ${EXCEL_INTERVAL_MINUTES} daqiqada Excel yuboriladi`)
-  console.log('✅ Kunlik hisobot taymeri ishlayapti')
-  console.log('\n📌 /login, /admin, /dailyreport, /dbcheck, /start, /start site1, /start site2')
+  if (CHANNEL_ID !== '@YOUR_CHANNEL_USERNAME') {
+    console.log(`📡 Kanal: ${CHANNEL_ID} ga har ${EXCEL_INTERVAL_MINUTES} daqiqada Excel yuboriladi`)
+  } else {
+    console.log('⚠️  Kanal ID sozlanmagan! CHANNEL_ID ni o‘zgartiring.')
+  }
+  console.log('✅ Kunlik hisobot taymeri ishlamoqda')
 })
 process.once('SIGINT', () => bot.stop('SIGINT'))
 process.once('SIGTERM', () => bot.stop('SIGTERM'))
