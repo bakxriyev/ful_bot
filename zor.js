@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const BOT_TOKEN = '8783455246:AAEnWJ8rUj5ubulU0wemIEtdV53xgaWhE5E'
+const BOT_TOKEN = '8783455246:AAGue6i2STwC7IXBLctEg50SmoYOw_JFVb4'
 const ADMIN_LOGIN = 'admin'
 const ADMIN_PASSWORD = 'admin123'
 
@@ -19,7 +19,6 @@ const TEMP_DIR      = path.join(__dirname, 'temp_exports')
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true })
 
-// ===== TOSHKENT VAQT YORDAMCHI =====
 const toTashkentDate = (isoStr) => {
   try {
     const d = new Date(isoStr)
