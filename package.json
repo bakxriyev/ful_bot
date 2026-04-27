@@ -2,6 +2,7 @@
   "name": "bot",
   "version": "1.0.0",
   "description": "",
+  "types": "commonjs",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -9,13 +10,14 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
+    "@supabase/supabase-js": "^2.105.0",
     "csv-writer": "^1.6.0",
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "node-cron": "^4.2.1",
+    "node-telegram-bot-api": "^0.67.0",
     "sqlite3": "^5.1.7",
     "telegraf": "^4.16.3"
   },

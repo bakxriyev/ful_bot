@@ -1,791 +1,720 @@
-import { Telegraf, Markup } from 'telegraf'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const { createClient } = require('@supabase/supabase-js');
+const ExcelJS = require('exceljs');
+const cron = require('node-cron');
+const fs = require('fs');
+const path = require('path');
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+// ========================
+// KONFIGURATSIYA
+// ========================
+const BOT_TOKEN = '8679225810:AAE-u-SX3esTae23LY09dYyAz_cgIPH4j_4';
+const CHANNEL_ID = '-1003920803109';
+const SUPABASE_URL = 'https://vxpvgeyktgyasegvycfp.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_pXpHGuZFzmhJUD6FkQeapQ__7D78i4w';
 
-const BOT_TOKEN = '8783455246:AAGue6i2STwC7IXBLctEg50SmoYOw_JFVb4'
-const ADMIN_LOGIN = 'admin'
-const ADMIN_PASSWORD = 'admin123'
+// ========================
+// INIT
+// ========================
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const CHANNEL_ID = '@botbazaiman'
-const EXCEL_INTERVAL_MINUTES = 10
+const SITE_LABELS = { a: '🅰️ A Sayt', b: '🅱️ B Sayt', c: '🅾️ C Sayt', d: '🔷 D Sayt' };
+const SITE_KEYS = ['a', 'b', 'c', 'd'];
 
-const USERS_CSV     = path.join(__dirname, 'users.csv')
-const MESSAGES_JSON = path.join(__dirname, 'start_messages.json')
-const ADMINS_JSON   = path.join(__dirname, 'admins.json')
-const TEMP_DIR      = path.join(__dirname, 'temp_exports')
+// Temp papka
+const TEMP_DIR = path.join(__dirname, 'temp');
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true })
+// ========================
+// SUPABASE FUNKSIYALAR
+// ========================
 
-const toTashkentDate = (isoStr) => {
-  try {
-    const d = new Date(isoStr)
-    if (isNaN(d)) return null
-    // Toshkent UTC+5
-    const tzOffset = 5 * 60
-    const local = new Date(d.getTime() + tzOffset * 60000)
-    return local
-  } catch { return null }
+async function getWebinarLeads() {
+  const { data, error } = await supabase
+    .from('leads')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`Webinar leads xatosi: ${error.message}`);
+  return data || [];
 }
 
-const formatTashkent = (isoStr) => {
-  const d = toTashkentDate(isoStr)
-  if (!d) return isoStr
-  const day   = String(d.getUTCDate()).padStart(2, '0')
-  const month = String(d.getUTCMonth() + 1).padStart(2, '0')
-  const year  = d.getUTCFullYear()
-  const hh    = String(d.getUTCHours()).padStart(2, '0')
-  const mm    = String(d.getUTCMinutes()).padStart(2, '0')
-  const ss    = String(d.getUTCSeconds()).padStart(2, '0')
-  return `${day}/${month}/${year}, ${hh}:${mm}:${ss}`
+async function getHuzurLeads() {
+  const { data, error } = await supabase
+    .from('huzur')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`Huzur leads xatosi: ${error.message}`);
+  return data || [];
 }
 
-// Hozirgi Toshkent vaqti ISO formatda
-const nowTashkentISO = () => {
-  const now = new Date()
-  const tzOffset = 5 * 60
-  const local = new Date(now.getTime() + tzOffset * 60000)
-  return local.toISOString().replace('Z', '+05:00')
+async function getWebinarBySite(site) {
+  const { data, error } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('type', site)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(`Webinar site xatosi: ${error.message}`);
+  return data || [];
 }
 
-// CSV satrdan sanani ISO ga o'girish
-// Format: dd/mm/yyyy, hh:mm:ss  yoki ISO yoki boshqa
-const parseDateToISO = (raw) => {
-  if (!raw || raw.trim() === '' || raw.trim() === 'Invalid Date') return ''
-  raw = raw.trim()
+// ========================
+// EXCEL YARATUVCHI FUNKSIYALAR
+// ========================
 
-  // dd/mm/yyyy, hh:mm:ss
-  const m1 = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4}),?\s*(\d{1,2}):(\d{2}):(\d{2})/)
-  if (m1) {
-    const [, dd, MM, yyyy, hh, min, ss] = m1
-    // UTC dan saqlash (Toshkent = UTC+5, shuning uchun -5 qilib UTC ga o'giramiz)
-    const d = new Date(Date.UTC(
-      parseInt(yyyy),
-      parseInt(MM) - 1,
-      parseInt(dd),
-      parseInt(hh) - 5,
-      parseInt(min),
-      parseInt(ss)
-    ))
-    return isNaN(d) ? raw : d.toISOString()
+async function createWebinarExcel(leads, filename = 'webinar_leads.xlsx') {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Leads Bot';
+  wb.created = new Date();
+
+  // Sheet 1: Barcha userlar
+  const wsAll = wb.addWorksheet('Barcha Userlar');
+  wsAll.columns = [
+    { header: '№', key: 'num', width: 6 },
+    { header: 'To\'liq Ism', key: 'full_name', width: 25 },
+    { header: 'Telefon', key: 'phone_number', width: 18 },
+    { header: 'Sayt', key: 'type', width: 12 },
+    { header: 'Sana', key: 'created_at', width: 22 },
+  ];
+  styleHeader(wsAll);
+  leads.forEach((l, i) => {
+    wsAll.addRow({
+      num: i + 1,
+      full_name: l.full_name || '',
+      phone_number: l.phone_number || '',
+      type: (l.type || '').toUpperCase(),
+      created_at: formatDate(l.created_at),
+    });
+  });
+  autoStyle(wsAll);
+
+  // Sheet 2-5: Har bir sayt bo'yicha
+  for (const site of SITE_KEYS) {
+    const siteLeads = leads.filter(l => (l.type || '').toLowerCase() === site);
+    const ws = wb.addWorksheet(`${site.toUpperCase()} Sayt`);
+    ws.columns = [
+      { header: '№', key: 'num', width: 6 },
+      { header: 'To\'liq Ism', key: 'full_name', width: 25 },
+      { header: 'Telefon', key: 'phone_number', width: 18 },
+      { header: 'Sana', key: 'created_at', width: 22 },
+    ];
+    styleHeader(ws);
+    siteLeads.forEach((l, i) => {
+      ws.addRow({
+        num: i + 1,
+        full_name: l.full_name || '',
+        phone_number: l.phone_number || '',
+        created_at: formatDate(l.created_at),
+      });
+    });
+    autoStyle(ws);
   }
 
-  // ISO format
-  if (raw.includes('T') || raw.includes('-')) {
-    const d = new Date(raw)
-    return isNaN(d) ? raw : d.toISOString()
-  }
+  // Sheet: Kunlik statistika
+  const wsStats = wb.addWorksheet('Kunlik Statistika');
+  wsStats.columns = [
+    { header: 'Sana', key: 'date', width: 15 },
+    { header: 'A Sayt', key: 'a', width: 12 },
+    { header: 'B Sayt', key: 'b', width: 12 },
+    { header: 'C Sayt', key: 'c', width: 12 },
+    { header: 'D Sayt', key: 'd', width: 12 },
+    { header: 'Jami', key: 'total', width: 12 },
+  ];
+  styleHeader(wsStats);
 
-  return raw
+  const dailyStats = getDailyStats(leads);
+  dailyStats.forEach(row => wsStats.addRow(row));
+  autoStyle(wsStats);
+
+  const filePath = path.join(TEMP_DIR, filename);
+  await wb.xlsx.writeFile(filePath);
+  return filePath;
 }
 
-// ===== CSV FAYLLARNI YARATISH =====
-const CSV_HEADER = "User ID,Username,Ism,Site turi,Qo'shilgan sana"
+async function createHuzurExcel(leads, filename = 'huzur_leads.xlsx') {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Leads Bot';
+  wb.created = new Date();
 
-const ensureCSV = () => {
-  if (!fs.existsSync(USERS_CSV)) {
-    fs.writeFileSync(USERS_CSV, CSV_HEADER + '\n', 'utf8')
-    console.log('✅ users.csv yaratildi')
-  }
-}
-ensureCSV()
+  // Sheet 1: Barcha userlar
+  const wsAll = wb.addWorksheet('Barcha Userlar');
+  wsAll.columns = [
+    { header: '№', key: 'num', width: 6 },
+    { header: 'To\'liq Ism', key: 'full_name', width: 25 },
+    { header: 'Telefon', key: 'phone_number', width: 18 },
+    { header: 'Manzil', key: 'address', width: 30 },
+    { header: 'Sana', key: 'created_at', width: 22 },
+  ];
+  styleHeader(wsAll);
+  leads.forEach((l, i) => {
+    wsAll.addRow({
+      num: i + 1,
+      full_name: l.full_name || '',
+      phone_number: l.phone_number || '',
+      address: l.address || '',
+      created_at: formatDate(l.created_at),
+    });
+  });
+  autoStyle(wsAll);
 
-if (!fs.existsSync(MESSAGES_JSON)) {
-  fs.writeFileSync(MESSAGES_JSON, JSON.stringify({ site1: [], site2: [], default: [] }, null, 2))
-}
-if (!fs.existsSync(ADMINS_JSON)) {
-  fs.writeFileSync(ADMINS_JSON, JSON.stringify({}))
-}
+  // Sheet: Kunlik ro'yxatdan o'tish
+  const wsDaily = wb.addWorksheet('Kunlik Statistika');
+  wsDaily.columns = [
+    { header: 'Sana', key: 'date', width: 15 },
+    { header: 'Ro\'yxatdan o\'tganlar', key: 'count', width: 22 },
+  ];
+  styleHeader(wsDaily);
 
-const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 60_000 })
+  const dailyMap = {};
+  leads.forEach(l => {
+    const d = formatDateOnly(l.created_at);
+    dailyMap[d] = (dailyMap[d] || 0) + 1;
+  });
+  Object.entries(dailyMap)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .forEach(([date, count]) => wsDaily.addRow({ date, count }));
+  autoStyle(wsDaily);
 
-// ===== SESSIYALAR =====
-let sessions = {}
-try { sessions = JSON.parse(fs.readFileSync(ADMINS_JSON, 'utf8')) } catch {}
-const isAdmin = userId => sessions[String(userId)] === true
-const saveSession = () => fs.writeFileSync(ADMINS_JSON, JSON.stringify(sessions, null, 2), 'utf8')
-
-// ===== START XABARLAR =====
-const readStartMessages = () => {
-  try {
-    const data = JSON.parse(fs.readFileSync(MESSAGES_JSON, 'utf8'))
-    return { site1: data.site1 || [], site2: data.site2 || [], default: data.default || [] }
-  } catch { return { site1: [], site2: [], default: [] } }
-}
-const writeStartMessages = data => fs.writeFileSync(MESSAGES_JSON, JSON.stringify(data, null, 2), 'utf8')
-
-// ===== CSV O'QISH =====
-// Format: User ID,Username,Ism,Site turi,Qo'shilgan sana
-// Sana: dd/mm/yyyy, hh:mm:ss  (vergul ichida)
-// Jami 5 ta ustun, lekin sana ichida vergul bor => split qilganda 6+ bo'lak
-
-const parseCSVLine = (line) => {
-  // 0: id, 1: username, 2: name, 3: siteType, 4+: date (vergul bilan)
-  const parts = line.split(',')
-  if (parts.length < 4) return null
-
-  const id        = parts[0].trim()
-  const username  = parts[1].trim()
-  const name      = parts[2].trim()
-  const siteType  = parts[3].trim()
-  // Sana: qolgan qismlarni birlashtirish
-  const dateRaw   = parts.slice(4).join(',').trim()
-
-  if (!id || isNaN(Number(id))) return null
-
-  let siteNorm = siteType
-  if (!siteNorm || siteNorm === '') siteNorm = 'unknown'
-  else if (['default', 'Oddiy start'].includes(siteNorm)) siteNorm = 'default'
-  else if (['site1', 'Site1'].includes(siteNorm)) siteNorm = 'site1'
-  else if (['site2', 'Site2'].includes(siteNorm)) siteNorm = 'site2'
-
-  const dateISO = parseDateToISO(dateRaw)
-
-  return { id, username, name, siteType: siteNorm, date: dateISO }
+  const filePath = path.join(TEMP_DIR, filename);
+  await wb.xlsx.writeFile(filePath);
+  return filePath;
 }
 
-const getUsers = () => {
-  try {
-    ensureCSV()
-    const content = fs.readFileSync(USERS_CSV, 'utf8')
-    const lines = content.split('\n').filter(l => l.trim())
-    // Header qatorini o'tkazib yuborish
-    const dataLines = lines.filter(l => !l.startsWith('User ID') && !l.startsWith('STATISTIKA') && !l.startsWith('Sayt turi') && !l.startsWith('Jami') && !l.startsWith('Bugun') && !l.startsWith('Hisobot'))
-    const users = dataLines.map(parseCSVLine).filter(Boolean)
-    return users
-  } catch (e) {
-    console.error('❌ getUsers xatolik:', e.message)
-    return []
-  }
+// ========================
+// YORDAMCHI FUNKSIYALAR
+// ========================
+
+function styleHeader(ws) {
+  const headerRow = ws.getRow(1);
+  headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2E4057' } };
+  headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
+  headerRow.height = 20;
 }
 
-// ===== ATOMIK YOZISH =====
-// Faqat data qismini saqlaydi (statistika yo'q)
-const writeUsers = (users) => {
-  ensureCSV()
-  const rows = users.map(u => {
-    const safeUsername = (u.username || '').replace(/\n/g, ' ')
-    const safeName     = (u.name     || '').replace(/\n/g, ' ')
-    const dateFmt      = u.date ? formatTashkent(u.date) : ''
-    return `${u.id},${safeUsername},${safeName},${u.siteType},${dateFmt}`
-  })
-  const data = [CSV_HEADER, ...rows].join('\n') + '\n'
-  const tmpFile = USERS_CSV + '.tmp'
-  fs.writeFileSync(tmpFile, data, 'utf8')
-  fs.renameSync(tmpFile, USERS_CSV)
-}
-
-const saveUser = (user, siteType) => {
-  try {
-    let users = getUsers()
-    const existing = users.find(u => u.id === String(user.id))
-    if (existing) {
-      existing.siteType = siteType
-      console.log(`🔄 Yangilandi: ${user.id} → ${siteType}`)
-    } else {
-      const safeUsername  = (user.username   || '').replace(/\n/g, ' ')
-      const safeFirstName = (user.first_name || '').replace(/\n/g, ' ')
-      // Hozirgi vaqtni UTC sifatida saqlash
-      users.push({
-        id: String(user.id),
-        username: safeUsername,
-        name: safeFirstName,
-        date: new Date().toISOString(),
-        siteType
-      })
-      console.log(`➕ Yangi: ${user.id} → ${siteType}`)
+function autoStyle(ws) {
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    row.eachCell(cell => {
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        right: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      };
+    });
+    if (rowNumber % 2 === 0) {
+      row.eachCell(cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F5F5' } };
+      });
     }
-    writeUsers(users)
-  } catch (e) {
-    console.error('saveUser xatosi:', e.message)
+  });
+}
+
+function formatDate(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatDateOnly(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+}
+
+function pad(n) { return n.toString().padStart(2, '0'); }
+
+function getDailyStats(leads) {
+  const map = {};
+  leads.forEach(l => {
+    const d = formatDateOnly(l.created_at);
+    const site = (l.type || 'unknown').toLowerCase();
+    if (!map[d]) map[d] = { date: d, a: 0, b: 0, c: 0, d: 0, total: 0 };
+    if (SITE_KEYS.includes(site)) map[d][site]++;
+    map[d].total++;
+  });
+  return Object.entries(map)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([, v]) => v);
+}
+
+function deleteFile(filePath) {
+  try { fs.unlinkSync(filePath); } catch {}
+}
+
+// ========================
+// KLAVIATURA MENULARI
+// ========================
+
+const mainMenu = {
+  reply_markup: {
+    keyboard: [
+      ['📚 Huzur Kursi', '🎯 Webinar'],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
   }
-}
+};
 
-// ===== STATISTIKA YORDAMCHILAR =====
-// ISO date dan Toshkent bo'yicha YYYY-MM-DD olish
-const getTashkentDateStr = (isoStr) => {
-  const d = toTashkentDate(isoStr)
-  if (!d) return ''
-  const y = d.getUTCFullYear()
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
-  const day = String(d.getUTCDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
-const getTodayStr = () => {
-  const now = new Date()
-  const d = new Date(now.getTime() + 5 * 60 * 60 * 1000)
-  const y = d.getUTCFullYear()
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
-  const day = String(d.getUTCDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
-const getYesterdayStr = () => {
-  const now = new Date()
-  const d = new Date(now.getTime() + 5 * 60 * 60 * 1000 - 86400000)
-  const y = d.getUTCFullYear()
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0')
-  const day = String(d.getUTCDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
-const getTodayUsers = () => {
-  const today = getTodayStr()
-  const users = getUsers()
-  return users.filter(u => getTashkentDateStr(u.date) === today)
-}
-
-// Kunlik breakdown: har bir kun nechta odam start bosgan
-const getDailyStats = (users) => {
-  const map = {}
-  for (const u of users) {
-    const ds = getTashkentDateStr(u.date)
-    if (!ds) continue
-    if (!map[ds]) map[ds] = 0
-    map[ds]++
+const webinarMenu = {
+  reply_markup: {
+    keyboard: [
+      ['📋 Barcha Userlar', '📊 Statistika'],
+      ['🅰️ A Sayt', '🅱️ B Sayt'],
+      ['🅾️ C Sayt', '🔷 D Sayt'],
+      ['📥 Excel (Barchasi)', '📥 Excel (Kunlik)'],
+      ['🏠 Bosh Menu'],
+    ],
+    resize_keyboard: true,
   }
-  return map
-}
+};
 
-// ===== EXPORT CSV =====
-const generateExportCSV = (siteType = null) => {
+const huzurMenu = {
+  reply_markup: {
+    keyboard: [
+      ['👥 Barcha Userlar', '📅 Kunlik Statistika'],
+      ['📥 Excel Yuklab Olish'],
+      ['🏠 Bosh Menu'],
+    ],
+    resize_keyboard: true,
+  }
+};
+
+// ========================
+// BOT STATE
+// ========================
+const userState = {};
+
+// ========================
+// XABAR HANDLERLARI
+// ========================
+
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  userState[chatId] = 'main';
+  bot.sendMessage(chatId,
+    `👋 *Assalomu alaykum!*\n\nBu bot Supabase bazasidagi ma'lumotlarni ko'rish va Excel yuklab olish uchun yaratilgan.\n\n*Quyidagi bo'limlardan birini tanlang:*`,
+    { parse_mode: 'Markdown', ...mainMenu }
+  );
+});
+
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+
+  if (!text || text.startsWith('/')) return;
+
+  // ======= MAIN MENU =======
+  if (text === '🏠 Bosh Menu') {
+    userState[chatId] = 'main';
+    return bot.sendMessage(chatId, '🏠 *Bosh Menu*\n\nBo\'limni tanlang:', { parse_mode: 'Markdown', ...mainMenu });
+  }
+
+  if (text === '📚 Huzur Kursi') {
+    userState[chatId] = 'huzur';
+    return bot.sendMessage(chatId, '📚 *Huzur Kursi Bo\'limi*\n\nQuyidagi amallardan birini tanlang:', { parse_mode: 'Markdown', ...huzurMenu });
+  }
+
+  if (text === '🎯 Webinar') {
+    userState[chatId] = 'webinar';
+    return bot.sendMessage(chatId, '🎯 *Webinar Bo\'limi*\n\nQuyidagi amallardan birini tanlang:', { parse_mode: 'Markdown', ...webinarMenu });
+  }
+
+  // ======= HUZUR BO'LIMI =======
+  if (userState[chatId] === 'huzur') {
+    if (text === '👥 Barcha Userlar') {
+      return handleHuzurAllUsers(chatId);
+    }
+    if (text === '📅 Kunlik Statistika') {
+      return handleHuzurDailyStats(chatId);
+    }
+    if (text === '📥 Excel Yuklab Olish') {
+      return handleHuzurExcel(chatId);
+    }
+  }
+
+  // ======= WEBINAR BO'LIMI =======
+  if (userState[chatId] === 'webinar') {
+    if (text === '📋 Barcha Userlar') {
+      return handleWebinarAllUsers(chatId);
+    }
+    if (text === '📊 Statistika') {
+      return handleWebinarStats(chatId);
+    }
+    if (text === '🅰️ A Sayt') return handleWebinarBySite(chatId, 'a');
+    if (text === '🅱️ B Sayt') return handleWebinarBySite(chatId, 'b');
+    if (text === '🅾️ C Sayt') return handleWebinarBySite(chatId, 'c');
+    if (text === '🔷 D Sayt') return handleWebinarBySite(chatId, 'd');
+    if (text === '📥 Excel (Barchasi)') return handleWebinarExcel(chatId, 'all');
+    if (text === '📥 Excel (Kunlik)') return handleWebinarExcel(chatId, 'daily');
+  }
+
+  // Default
+  bot.sendMessage(chatId, '❓ Noma\'lum buyruq. /start bosing yoki menyudan tanlang.', mainMenu);
+});
+
+// ========================
+// HUZUR HANDLERLARI
+// ========================
+
+async function handleHuzurAllUsers(chatId) {
   try {
-    const users = getUsers()
-    const filtered = siteType ? users.filter(u => u.siteType === siteType) : users
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Ma\'lumotlar yuklanmoqda...');
+    const leads = await getHuzurLeads();
 
-    const today = getTodayStr()
-    const todayCount = filtered.filter(u => getTashkentDateStr(u.date) === today).length
-
-    // Kunlik breakdown
-    const daily = getDailyStats(filtered)
-    const sortedDays = Object.keys(daily).sort().reverse()
-
-    let csv = '\uFEFF'
-    csv += CSV_HEADER + '\n'
-
-    filtered.forEach(u => {
-      const safeUsername = (u.username || "Yo'q")
-      const safeName     = (u.name     || "Yo'q")
-      const dateFmt      = u.date ? formatTashkent(u.date) : ''
-      csv += `${u.id},${safeUsername},${safeName},${u.siteType},${dateFmt}\n`
-    })
-
-    csv += `\nSTATISTIKA\n`
-    csv += `Sayt turi,${siteType || 'Barcha'}\n`
-    csv += `Jami foydalanuvchilar,${filtered.length}\n`
-    csv += `Bugun qo'shilganlar,${todayCount}\n`
-    csv += `Hisobot sanasi,${formatTashkent(new Date().toISOString())}\n`
-
-    // Kunlik hisobot
-    csv += `\nKUNLIK TAQSIMOT\n`
-    csv += `Sana,Yangi foydalanuvchilar\n`
-    for (const ds of sortedDays) {
-      // dd/mm/yyyy formatga o'tkazish
-      const [y, m, d] = ds.split('-')
-      csv += `${d}/${m}/${y},${daily[ds]}\n`
+    if (leads.length === 0) {
+      return bot.editMessageText('📭 Huzur kursida hali user yo\'q.', { chat_id: chatId, message_id: loadMsg.message_id });
     }
 
-    const filename = path.join(TEMP_DIR, `export_${siteType || 'all'}_${Date.now()}.csv`)
-    fs.writeFileSync(filename, csv, 'utf8')
-    return filename
-  } catch (e) {
-    console.error('generateExportCSV xatosi:', e.message)
-    return null
+    // Har bir sahifada 20 ta ko'rsatamiz
+    const PAGE_SIZE = 20;
+    const totalPages = Math.ceil(leads.length / PAGE_SIZE);
+
+    let msg = `📚 *HUZUR KURSI — BARCHA USERLAR*\n`;
+    msg += `📊 Jami: *${leads.length}* ta\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const pageLeads = leads.slice(0, PAGE_SIZE);
+    pageLeads.forEach((l, i) => {
+      msg += `*${i + 1}.* ${l.full_name || 'Ism yo\'q'}\n`;
+      msg += `📞 ${l.phone_number || 'Tel yo\'q'}\n`;
+      msg += `📍 ${l.address || 'Manzil yo\'q'}\n`;
+      msg += `📅 ${formatDate(l.created_at)}\n\n`;
+    });
+
+    if (totalPages > 1) {
+      msg += `\n_Sahifa 1/${totalPages} (faqat birinchi ${PAGE_SIZE} ta ko'rsatildi)_\n`;
+      msg += `_To'liq ro'yxat uchun Excel yuklab oling_ ⬇️`;
+    }
+
+    await bot.editMessageText(msg, {
+      chat_id: chatId,
+      message_id: loadMsg.message_id,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('handleHuzurAllUsers:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
   }
 }
 
-const safeDeleteTempFile = filepath => {
+async function handleHuzurDailyStats(chatId) {
   try {
-    if (!filepath) return
-    const resolved = path.resolve(filepath)
-    if (resolved.startsWith(path.resolve(TEMP_DIR)) && fs.existsSync(resolved)) {
-      fs.unlinkSync(resolved)
-    }
-  } catch {}
-}
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
+    const leads = await getHuzurLeads();
 
-// ===== NON-BLOCKING BROADCAST QUEUE =====
-// Broadcast bot'ni qotirmasligi uchun background'da ishlaydi.
-// Har bir xabar orasida setImmediate → event loop bo'shashadi →
-// boshqa /start, admin buyruqlari ishlayveradi.
-
-const broadcastQueue = [] // { users, chatId, msgId, fromChatId, stMsgId, resolve }
-let broadcastRunning = false
-
-const sleep = ms => new Promise(r => setTimeout(r, ms))
-
-const runBroadcastQueue = async () => {
-  if (broadcastRunning) return
-  broadcastRunning = true
-  while (broadcastQueue.length > 0) {
-    const job = broadcastQueue.shift()
-    await processBroadcastJob(job)
-  }
-  broadcastRunning = false
-}
-
-const processBroadcastJob = async (job) => {
-  const { users, fromChatId, msgId, stMsgId, chatId } = job
-  let ok = 0, err = 0
-  const total = users.length
-
-  for (let i = 0; i < users.length; i++) {
-    const u = users[i]
-    try {
-      await bot.telegram.copyMessage(u.id, fromChatId, msgId)
-      ok++
-    } catch {
-      err++
+    if (leads.length === 0) {
+      return bot.editMessageText('📭 Huzur kursida hali user yo\'q.', { chat_id: chatId, message_id: loadMsg.message_id });
     }
 
-    const done = ok + err
+    const dailyMap = {};
+    leads.forEach(l => {
+      const d = formatDateOnly(l.created_at);
+      dailyMap[d] = (dailyMap[d] || 0) + 1;
+    });
 
-    // Har 20 ta da progress yangilash
-    if (done % 20 === 0 || done === total) {
-      try {
-        await bot.telegram.editMessageText(
-          chatId, stMsgId, null,
-          `📤 ${done}/${total} (✅${ok} ❌${err})`
-        )
-      } catch {}
-    }
+    const sorted = Object.entries(dailyMap).sort((a, b) => a[0].localeCompare(b[0]));
 
-    // Event loop'ni bo'shatish uchun — bu asosiy trick
-    // setImmediate boshqa pending callbacklarni ishlashiga ruxsat beradi
-    await new Promise(r => setImmediate(r))
+    let msg = `📚 *HUZUR KURSI — KUNLIK STATISTIKA*\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+    sorted.forEach(([date, count]) => {
+      msg += `📅 *${date}* — ${count} ta user\n`;
+    });
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `📊 *Jami: ${leads.length} ta*`;
 
-    // Telegram rate limit: 30 msg/sec, bir oz kutish
-    if (i % 30 === 29) await sleep(1000)
-  }
-
-  try {
-    await bot.telegram.editMessageText(
-      chatId, stMsgId, null,
-      `✅ Broadcast tugadi!\n📤 Jami: ${total}\n✅ Muvaffaqiyatli: ${ok}\n❌ Xatolik: ${err}`
-    )
-  } catch {}
-}
-
-// ===== ADMIN STATE =====
-const adminState = {}
-
-// ===== START XABARLARNI YUBORISH =====
-const sendStartMessages = async (userId, siteType) => {
-  try {
-    const all = readStartMessages()
-    const msgs = all[siteType] || []
-    for (const msg of msgs) {
-      await new Promise(resolve => setTimeout(resolve, msg.delay * 1000))
-      const inlineKeyboard = msg.btn_text && msg.btn_url
-        ? { reply_markup: { inline_keyboard: [[{ text: msg.btn_text, url: msg.btn_url }]] } }
-        : {}
-      try {
-        if (msg.media_type === 'text') await bot.telegram.sendMessage(userId, msg.text, inlineKeyboard)
-        else if (msg.media_type === 'photo') await bot.telegram.sendPhoto(userId, msg.media_file_id, { caption: msg.text, ...inlineKeyboard })
-        else if (msg.media_type === 'video') await bot.telegram.sendVideo(userId, msg.media_file_id, { caption: msg.text, ...inlineKeyboard })
-        else if (msg.media_type === 'video_note') {
-          await bot.telegram.sendVideoNote(userId, msg.media_file_id, inlineKeyboard)
-          if (msg.text) await bot.telegram.sendMessage(userId, msg.text)
-        }
-      } catch (e) { console.error(`Xabar yuborilmadi (${userId}):`, e.message) }
-    }
-    return msgs.length
-  } catch { return 0 }
-}
-
-// ===== KLAVIATURA =====
-const adminKeyboard = () => Markup.keyboard([
-  ['➕ Site1 xabar', '📋 Site1 xabarlar'],
-  ['➕ Site2 xabar', '📋 Site2 xabarlar'],
-  ['➕ Oddiy start xabar', '📋 Oddiy start xabarlar'],
-  ['📢 Hammaga xabar', '📊 Statistika'],
-  ['👥 Barcha userlar', '📥 Excel yuklab olish'],
-  ['📅 Kunlik taqsimot']
-]).resize()
-
-// ===== STATISTIKA XABARI =====
-const buildStatsText = (users) => {
-  const today     = getTodayStr()
-  const yesterday = getYesterdayStr()
-  const msgs      = readStartMessages()
-
-  const todayCount     = users.filter(u => getTashkentDateStr(u.date) === today).length
-  const yesterdayCount = users.filter(u => getTashkentDateStr(u.date) === yesterday).length
-  const site1Count   = users.filter(u => u.siteType === 'site1').length
-  const site2Count   = users.filter(u => u.siteType === 'site2').length
-  const defCount     = users.filter(u => u.siteType === 'default').length
-  const unknownCount = users.filter(u => u.siteType === 'unknown').length
-
-  const tNow = formatTashkent(new Date().toISOString())
-  return `📊 *STATISTIKA*\n📅 ${tNow}\n\n👥 *Jami: ${users.length}*\n📅 Bugun: ${todayCount}\n📅 Kecha: ${yesterdayCount}\n\n🌐 Site1: ${site1Count} (xabarlar: ${msgs.site1.length})\n🌐 Site2: ${site2Count} (xabarlar: ${msgs.site2.length})\n🟢 Oddiy start: ${defCount} (xabarlar: ${msgs.default.length})\n❓ Noma'lum: ${unknownCount}`
-}
-
-// ===== KUNLIK HISOBOT =====
-const sendDailyReport = async () => {
-  try {
-    const admins = Object.entries(sessions).filter(([, v]) => v === true).map(([id]) => id)
-    if (!admins.length) return
-    const users = getUsers()
-    const text = buildStatsText(users)
-    const today = getTodayStr()
-    const file = generateExportCSV(null)
-    for (const id of admins) {
-      await bot.telegram.sendMessage(id, text, { parse_mode: 'Markdown' })
-      if (file) await bot.telegram.sendDocument(id, { source: file, filename: `daily_${today}.csv` }, { caption: `📎 Barcha foydalanuvchilar – ${users.length} ta` }).catch(() => {})
-    }
-    if (file) safeDeleteTempFile(file)
-  } catch (e) { console.error('Kunlik hisobot xatosi:', e.message) }
-}
-
-// ===== KANALGA EXCEL YUBORISH =====
-const sendExcelToChannel = async () => {
-  try {
-    const users = getUsers()
-    if (!users || users.length === 0) return
-    const filePath = generateExportCSV(null)
-    if (!filePath) return
-    const now = formatTashkent(new Date().toISOString())
-    const caption = `📊 Avtomatik hisobot (har ${EXCEL_INTERVAL_MINUTES} daqiqa)\n👥 Jami foydalanuvchilar: ${users.length}\n📅 Sana: ${now}`
-    await bot.telegram.sendDocument(
-      CHANNEL_ID,
-      { source: filePath, filename: `users_report_${Date.now()}.csv` },
-      { caption }
-    )
-    console.log(`✅ Kanalga Excel yuborildi (${users.length} ta)`)
-    safeDeleteTempFile(filePath)
-  } catch (e) {
-    console.error('❌ Kanalga yuborishda xatolik:', e.message)
+    bot.editMessageText(msg, {
+      chat_id: chatId,
+      message_id: loadMsg.message_id,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('handleHuzurDailyStats:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
   }
 }
 
-setInterval(sendExcelToChannel, EXCEL_INTERVAL_MINUTES * 60 * 1000)
-
-// Kunlik hisobot Toshkent 00:00
-let lastSentDate = ''
-setInterval(() => {
-  const today = getTodayStr()
-  const tNow  = new Date(new Date().getTime() + 5 * 60 * 60 * 1000)
-  const h = tNow.getUTCHours()
-  const min = tNow.getUTCMinutes()
-  if (h === 0 && min === 0 && lastSentDate !== today) {
-    lastSentDate = today
-    sendDailyReport()
-  }
-}, 60_000)
-
-// ===== /start =====
-bot.start(async ctx => {
+async function handleHuzurExcel(chatId) {
   try {
-    const args = (ctx.message.text || '').split(' ')
-    let site = 'default'
-    if (args[1]?.toLowerCase().includes('site1')) site = 'site1'
-    else if (args[1]?.toLowerCase().includes('site2')) site = 'site2'
-    saveUser(ctx.from, site)
-    const sent = await sendStartMessages(ctx.from.id, site)
-    if (sent === 0) await ctx.reply('Botimizga xush kelibsiz!')
-  } catch (e) { console.error('/start xatosi:', e.message) }
-})
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Excel fayl yaratilmoqda...');
+    const leads = await getHuzurLeads();
 
-// ===== LOGIN/LOGOUT/ADMIN =====
-bot.command('login', ctx => { adminState[ctx.from.id] = { step: 'login' }; ctx.reply('👤 Login kiriting:') })
-bot.command('logout', ctx => {
-  sessions[String(ctx.from.id)] = false; saveSession(); ctx.reply('👋 Tizimdan chiqdingiz')
-})
-bot.command('admin', ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('⛔️ Sizda admin huquqi yo\'q')
-  adminState[ctx.from.id] = { step: 'menu' }; ctx.reply('🛠 Admin panel', adminKeyboard())
-})
-bot.command('dailyreport', async ctx => {
-  if (isAdmin(ctx.from.id)) { await ctx.reply('📊 Hisobot yuborilmoqda...'); await sendDailyReport() }
-})
-bot.command('dbcheck', ctx => {
-  if (!isAdmin(ctx.from.id)) return
-  const users = getUsers()
-  ctx.reply(`🗃 Baza: ${USERS_CSV}\n👥 Jami: ${users.length}\n📅 Bugun: ${getTodayUsers().length}`)
-})
+    if (leads.length === 0) {
+      return bot.editMessageText('📭 Huzur kursida hali user yo\'q.', { chat_id: chatId, message_id: loadMsg.message_id });
+    }
 
-// ===== TUGMALAR =====
-const startAddMessage = (ctx, site) => {
-  if (!isAdmin(ctx.from.id)) return
-  adminState[ctx.from.id] = { step: 'wait_media', site }
-  ctx.reply(`📨 ${site === 'default' ? 'Oddiy start' : site.toUpperCase()} uchun media yuboring yoki /skip`, Markup.keyboard([['/skip']]).resize())
-}
+    const ts = Date.now();
+    const filePath = await createHuzurExcel(leads, `huzur_${ts}.xlsx`);
 
-const showMessagesList = async (ctx, site) => {
-  if (!isAdmin(ctx.from.id)) return
-  const list = readStartMessages()[site] || []
-  if (!list.length) return ctx.reply(`❌ ${site === 'default' ? 'Oddiy start' : site.toUpperCase()} uchun start xabarlari yo'q`)
-  for (const m of list) {
-    try {
-      if (m.media_type === 'text') await ctx.reply(`📝 ${m.text}`)
-      else if (m.media_type === 'photo') await ctx.replyWithPhoto(m.media_file_id, { caption: m.text || '' })
-      else if (m.media_type === 'video') await ctx.replyWithVideo(m.media_file_id, { caption: m.text || '' })
-      else if (m.media_type === 'video_note') { await ctx.replyWithVideoNote(m.media_file_id); if (m.text) await ctx.reply(`📝 ${m.text}`) }
-    } catch (e) { await ctx.reply(`⚠️ Xato: ${e.message}`) }
-    await ctx.reply(
-      `🆔 ID: ${m.id}\n📦 Turi: ${m.media_type}\n⏱ Kechikish: ${m.delay} sek\n🔘 Tugma: ${m.btn_text ? m.btn_text + ' → ' + m.btn_url : 'Yo\'q'}`,
-      Markup.inlineKeyboard([
-        [Markup.button.callback('✏️ Matn', `edit_text_${site}_${m.id}`), Markup.button.callback('🖼 Media', `edit_media_${site}_${m.id}`)],
-        [Markup.button.callback('🔘 Tugma matni', `edit_btn_text_${site}_${m.id}`), Markup.button.callback('🔗 Tugma link', `edit_btn_url_${site}_${m.id}`)],
-        [Markup.button.callback('⏱ Kechikish', `edit_delay_${site}_${m.id}`), Markup.button.callback('❌ Tugmani o\'chir', `delete_btn_${site}_${m.id}`)],
-        [Markup.button.callback('🗑 Xabarni o\'chirish', `delete_msg_${site}_${m.id}`)]
-      ])
-    )
+    await bot.deleteMessage(chatId, loadMsg.message_id);
+    await bot.sendDocument(chatId, filePath, {
+      caption: `📚 *Huzur Kursi*\n📊 Jami: ${leads.length} ta user\n📅 ${formatDate(new Date().toISOString())}`,
+      parse_mode: 'Markdown',
+    });
+    deleteFile(filePath);
+  } catch (err) {
+    console.error('handleHuzurExcel:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
   }
 }
 
-bot.hears('➕ Site1 xabar',        ctx => startAddMessage(ctx, 'site1'))
-bot.hears('➕ Site2 xabar',        ctx => startAddMessage(ctx, 'site2'))
-bot.hears('➕ Oddiy start xabar',  ctx => startAddMessage(ctx, 'default'))
-bot.hears('📋 Site1 xabarlar',    ctx => showMessagesList(ctx, 'site1'))
-bot.hears('📋 Site2 xabarlar',    ctx => showMessagesList(ctx, 'site2'))
-bot.hears('📋 Oddiy start xabarlar', ctx => showMessagesList(ctx, 'default'))
+// ========================
+// WEBINAR HANDLERLARI
+// ========================
 
-bot.hears('📊 Statistika', async ctx => {
-  if (!isAdmin(ctx.from.id)) return
-  const users = getUsers()
-  await ctx.reply(buildStatsText(users), { parse_mode: 'Markdown' })
-})
-
-bot.hears('👥 Barcha userlar', ctx => {
-  if (!isAdmin(ctx.from.id)) return
-  const users = getUsers()
-  const site1Count   = users.filter(u => u.siteType === 'site1').length
-  const site2Count   = users.filter(u => u.siteType === 'site2').length
-  const defCount     = users.filter(u => u.siteType === 'default').length
-  const unknownCount = users.filter(u => u.siteType === 'unknown').length
-  ctx.reply(`👥 Jami: ${users.length}\n🌐 Site1: ${site1Count}\n🌐 Site2: ${site2Count}\n🟢 Oddiy start: ${defCount}\n❓ Noma'lum: ${unknownCount}\n📅 Bugun: ${getTodayUsers().length}`)
-})
-
-bot.hears('📥 Excel yuklab olish', ctx => {
-  if (!isAdmin(ctx.from.id)) return
-  adminState[ctx.from.id] = { step: 'excel_choice' }
-  ctx.reply('Qaysi guruh?', Markup.keyboard([
-    ['📊 Barcha', '🌐 Site1'],
-    ['🌐 Site2', '🟢 Oddiy start'],
-    ['⬅️ Orqaga']
-  ]).resize())
-})
-
-// Kunlik taqsimot
-bot.hears('📅 Kunlik taqsimot', async ctx => {
-  if (!isAdmin(ctx.from.id)) return
-  const users = getUsers()
-  const daily = getDailyStats(users)
-  const sortedDays = Object.keys(daily).sort().reverse().slice(0, 30)
-  if (!sortedDays.length) return ctx.reply('📅 Ma\'lumot yo\'q')
-  let text = '📅 *KUNLIK TAQSIMOT (so\'nggi 30 kun)*\n\n'
-  for (const ds of sortedDays) {
-    const [y, m, d] = ds.split('-')
-    text += `${d}/${m}/${y}: *${daily[ds]}* ta\n`
-  }
-  await ctx.reply(text, { parse_mode: 'Markdown' })
-})
-
-// ===== CALLBACK =====
-bot.on('callback_query', async ctx => {
-  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Ruxsat yo\'q')
+async function handleWebinarAllUsers(chatId) {
   try {
-    const d = ctx.callbackQuery.data.split('_')
-    const id = d.pop(), site = d.pop(), act = d.join('_')
-    const all = readStartMessages(); const msgs = all[site] || []; const m = msgs.find(x => x.id === id)
-    if (!m) return ctx.answerCbQuery('Topilmadi')
-    if (act === 'delete_msg') {
-      all[site] = msgs.filter(x => x.id !== id); writeStartMessages(all); await ctx.deleteMessage(); return
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Ma\'lumotlar yuklanmoqda...');
+    const leads = await getWebinarLeads();
+
+    if (leads.length === 0) {
+      return bot.editMessageText('📭 Webinarda hali user yo\'q.', { chat_id: chatId, message_id: loadMsg.message_id });
     }
-    if (act === 'delete_btn') {
-      m.btn_text = ''; m.btn_url = ''; writeStartMessages(all); await ctx.answerCbQuery('Tugma olib tashlandi'); return
+
+    const PAGE_SIZE = 20;
+    const totalPages = Math.ceil(leads.length / PAGE_SIZE);
+    const siteCounts = {};
+    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    leads.forEach(l => {
+      const s = (l.type || '').toLowerCase();
+      if (SITE_KEYS.includes(s)) siteCounts[s]++;
+    });
+
+    let msg = `🎯 *WEBINAR — BARCHA USERLAR*\n`;
+    msg += `📊 Jami: *${leads.length}* ta\n`;
+    SITE_KEYS.forEach(s => {
+      msg += `${SITE_LABELS[s]}: ${siteCounts[s]} ta\n`;
+    });
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const pageLeads = leads.slice(0, PAGE_SIZE);
+    pageLeads.forEach((l, i) => {
+      msg += `*${i + 1}.* ${l.full_name || 'Ism yo\'q'}\n`;
+      msg += `📞 ${l.phone_number || 'Tel yo\'q'}\n`;
+      msg += `🌐 Sayt: *${(l.type || '-').toUpperCase()}*\n`;
+      msg += `📅 ${formatDate(l.created_at)}\n\n`;
+    });
+
+    if (totalPages > 1) {
+      msg += `_Sahifa 1/${totalPages} (faqat birinchi ${PAGE_SIZE} ta)_\n`;
+      msg += `_To'liq ro'yxat uchun Excel yuklab oling_ ⬇️`;
     }
-    if (act.startsWith('edit_')) {
-      const field = act.replace('edit_', '')
-      adminState[ctx.from.id] = { step: `edit_${field}`, site, id }
-      const prompts = {
-        text: '✏️ Yangi matn',
-        media: '🖼 Yangi media',
-        btn_text: '🔘 Tugma matni',
-        btn_url: '🔗 Tugma link',
-        delay: '⏱ Kechikish (soniya)'
+
+    bot.editMessageText(msg, {
+      chat_id: chatId,
+      message_id: loadMsg.message_id,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('handleWebinarAllUsers:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+  }
+}
+
+async function handleWebinarStats(chatId) {
+  try {
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
+    const leads = await getWebinarLeads();
+
+    const siteCounts = {};
+    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    leads.forEach(l => {
+      const s = (l.type || '').toLowerCase();
+      if (SITE_KEYS.includes(s)) siteCounts[s]++;
+    });
+
+    let msg = `📊 *WEBINAR — UMUMIY STATISTIKA*\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+    msg += `👥 *Jami userlar: ${leads.length} ta*\n\n`;
+    msg += `*Saytlar bo'yicha:*\n`;
+    SITE_KEYS.forEach(s => {
+      const count = siteCounts[s];
+      const percent = leads.length ? ((count / leads.length) * 100).toFixed(1) : '0.0';
+      const bar = '▓'.repeat(Math.round(count / Math.max(leads.length, 1) * 10));
+      msg += `${SITE_LABELS[s]}: *${count}* ta (${percent}%) ${bar}\n`;
+    });
+
+    // Oxirgi 7 kunlik statistika
+    const now = new Date();
+    const last7 = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      last7.push(formatDateOnly(d.toISOString()));
+    }
+
+    msg += `\n*So'nggi 7 kunlik:*\n`;
+    last7.forEach(date => {
+      const dayLeads = leads.filter(l => formatDateOnly(l.created_at) === date);
+      if (dayLeads.length > 0) {
+        const bySite = {};
+        SITE_KEYS.forEach(s => bySite[s] = 0);
+        dayLeads.forEach(l => {
+          const s = (l.type || '').toLowerCase();
+          if (SITE_KEYS.includes(s)) bySite[s]++;
+        });
+        const siteStr = SITE_KEYS.map(s => `${s.toUpperCase()}:${bySite[s]}`).join(' ');
+        msg += `📅 ${date}: *${dayLeads.length}* ta | ${siteStr}\n`;
       }
-      await ctx.reply(prompts[field] || 'Qiymat kiriting:')
-      return ctx.answerCbQuery()
-    }
-    await ctx.answerCbQuery('Amal bajarilmadi')
-  } catch { ctx.answerCbQuery('Xatolik') }
-})
+    });
 
-// ===== BARCHA MATNLI XABARLAR =====
-bot.on('message', async ctx => {
-  const uid   = ctx.from.id
-  const state = adminState[uid]
-  const txt   = ctx.message.text || ctx.message.caption || ''
-
-  // --- Broadcast tugmasi ---
-  if (txt === '📢 Hammaga xabar' && isAdmin(uid)) {
-    adminState[uid] = { step: 'broadcast_target' }
-    return ctx.reply('Guruhni tanlang:', Markup.keyboard([
-      ['🌐 Site1', '🌐 Site2'], ['🟢 Oddiy start', '👥 Barcha'], ['⬅️ Orqaga']
-    ]).resize())
+    bot.editMessageText(msg, {
+      chat_id: chatId,
+      message_id: loadMsg.message_id,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('handleWebinarStats:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
   }
+}
 
-  // --- Login bosqichlari ---
-  if (state?.step === 'login') { adminState[uid] = { step: 'password', login: txt }; return ctx.reply('🔐 Parol:') }
-  if (state?.step === 'password') {
-    if (state.login === ADMIN_LOGIN && txt === ADMIN_PASSWORD) {
-      sessions[String(uid)] = true; saveSession(); delete adminState[uid]
-      return ctx.reply('✅ Xush kelibsiz, admin!', adminKeyboard())
-    } else { delete adminState[uid]; return ctx.reply('❌ Noto\'g\'ri') }
-  }
+async function handleWebinarBySite(chatId, site) {
+  try {
+    const loadMsg = await bot.sendMessage(chatId, `⏳ ${SITE_LABELS[site]} ma'lumotlari yuklanmoqda...`);
+    const leads = await getWebinarBySite(site);
 
-  if (!isAdmin(uid)) return
-
-  // --- Excel tanlov ---
-  if (state?.step === 'excel_choice') {
-    let site = null
-    if (txt === '📊 Barcha')      site = null
-    else if (txt === '🌐 Site1')   site = 'site1'
-    else if (txt === '🌐 Site2')   site = 'site2'
-    else if (txt === '🟢 Oddiy start') site = 'default'
-    else if (txt === '⬅️ Orqaga') { delete adminState[uid]; return ctx.reply('Admin panel', adminKeyboard()) }
-    else return ctx.reply('Noto\'g\'ri tanlov')
-
-    const fn = generateExportCSV(site)
-    if (fn) {
-      const count = getUsers().filter(u => !site || u.siteType === site).length
-      await ctx.replyWithDocument({ source: fn, filename: 'users.csv' }, { caption: `👥 Jami: ${count} ta` })
-      safeDeleteTempFile(fn)
-    } else {
-      await ctx.reply('❌ Xatolik yuz berdi')
-    }
-    delete adminState[uid]; return ctx.reply('✅', adminKeyboard())
-  }
-
-  // --- Media qo'shish ---
-  if (state?.step === 'wait_media') {
-    const site = state.site
-    if (txt === '/skip') { adminState[uid] = { step: 'wait_text', site, media_type: 'text' }; return ctx.reply('Matn yuboring:') }
-    let mt = null, fid = null
-    if (ctx.message.photo)      { mt = 'photo';      fid = ctx.message.photo.pop().file_id }
-    else if (ctx.message.video) { mt = 'video';      fid = ctx.message.video.file_id }
-    else if (ctx.message.video_note) { mt = 'video_note'; fid = ctx.message.video_note.file_id }
-    else return ctx.reply('Media yoki /skip')
-    adminState[uid] = { step: 'wait_text', site, media_type: mt, media_file_id: fid }
-    return ctx.reply('Media uchun caption (/skip – bo\'sh)', Markup.keyboard([['/skip']]).resize())
-  }
-  if (state?.step === 'wait_text') {
-    const text = txt === '/skip' ? '' : (txt || '')
-    adminState[uid] = { ...state, text, step: 'wait_button' }
-    return ctx.reply('Inline tugma qo\'shilsinmi?', Markup.keyboard([['Ha'], ['Yo\'q']]).resize())
-  }
-  if (state?.step === 'wait_button') {
-    if (txt === 'Ha') { adminState[uid] = { ...state, step: 'wait_btn_text' }; return ctx.reply('Tugma matni:') }
-    else { adminState[uid] = { ...state, btn_text: '', btn_url: '', step: 'wait_delay' }; return ctx.reply('Kechikish (soniya):') }
-  }
-  if (state?.step === 'wait_btn_text') { adminState[uid] = { ...state, btn_text: txt, step: 'wait_btn_url' }; return ctx.reply('Tugma linki:') }
-  if (state?.step === 'wait_btn_url') { adminState[uid] = { ...state, btn_url: txt, step: 'wait_delay' }; return ctx.reply('Kechikish (soniya):') }
-  if (state?.step === 'wait_delay') {
-    const d = parseFloat(txt); if (isNaN(d)) return ctx.reply('Raqam kiriting')
-    if (!state.site) { delete adminState[uid]; return ctx.reply('Xatolik: site topilmadi') }
-    const all = readStartMessages()
-    const nm = {
-      id: String(Date.now()),
-      media_type: state.media_type || 'text',
-      media_file_id: state.media_file_id || '',
-      text: state.text || '',
-      delay: d,
-      btn_text: state.btn_text || '',
-      btn_url: state.btn_url || ''
-    }
-    if (!all[state.site]) all[state.site] = []
-    all[state.site].push(nm)
-    writeStartMessages(all)
-    delete adminState[uid]
-    return ctx.reply(`✅ ${state.site === 'default' ? 'Oddiy start' : state.site.toUpperCase()} uchun xabar qo'shildi`, adminKeyboard())
-  }
-
-  // --- Tahrirlash ---
-  if (state?.step?.startsWith('edit_')) {
-    const field = state.step.replace('edit_', '')
-    const all = readStartMessages(); const msgs = all[state.site] || []; const m = msgs.find(x => x.id === state.id)
-    if (!m) { delete adminState[uid]; return ctx.reply('Topilmadi') }
-    try {
-      if (field === 'text') m.text = txt
-      else if (field === 'media') {
-        if (ctx.message.photo)      { m.media_type = 'photo';      m.media_file_id = ctx.message.photo.pop().file_id }
-        else if (ctx.message.video) { m.media_type = 'video';      m.media_file_id = ctx.message.video.file_id }
-        else if (ctx.message.video_note) { m.media_type = 'video_note'; m.media_file_id = ctx.message.video_note.file_id }
-        else return ctx.reply('Media yuboring')
-      } else if (field === 'btn_text') m.btn_text = txt
-      else if (field === 'btn_url')   m.btn_url  = txt
-      else if (field === 'delay') { const v = parseFloat(txt); if (isNaN(v)) return ctx.reply('Raqam'); m.delay = v }
-      writeStartMessages(all); delete adminState[uid]; return ctx.reply('✅ O\'zgartirildi', adminKeyboard())
-    } catch { delete adminState[uid]; return ctx.reply('Xatolik', adminKeyboard()) }
-  }
-
-  // --- Broadcast ---
-  if (state?.step === 'broadcast_target') {
-    let target = null
-    if (txt === '🌐 Site1')        target = 'site1'
-    else if (txt === '🌐 Site2')   target = 'site2'
-    else if (txt === '🟢 Oddiy start') target = 'default'
-    else if (txt === '👥 Barcha')  target = 'all'
-    else if (txt === '⬅️ Orqaga') { delete adminState[uid]; return ctx.reply('Admin panel', adminKeyboard()) }
-    else return ctx.reply('Guruhni tanlang', Markup.keyboard([
-      ['🌐 Site1', '🌐 Site2'], ['🟢 Oddiy start', '👥 Barcha'], ['⬅️ Orqaga']
-    ]).resize())
-
-    // Nechta odam bor – ko'rsatish
-    const allUsers = getUsers()
-    const targetUsers = target === 'all' ? allUsers : allUsers.filter(u => u.siteType === target)
-    adminState[uid] = { step: 'broadcast_send', target }
-    return ctx.reply(
-      `✅ Tanlandi: ${target === 'all' ? 'Barcha' : target}\n👥 ${targetUsers.length} ta foydalanuvchi\n\nYuboriladigan xabarni yuboring:`,
-      Markup.removeKeyboard()
-    )
-  }
-
-  if (state?.step === 'broadcast_send') {
-    const allUsers = getUsers()
-    const targetUsers = state.target === 'all' ? allUsers : allUsers.filter(u => u.siteType === state.target)
-
-    if (!targetUsers.length) {
-      delete adminState[uid]
-      return ctx.reply('❌ Foydalanuvchi topilmadi', adminKeyboard())
+    if (leads.length === 0) {
+      return bot.editMessageText(`📭 ${SITE_LABELS[site]} da hali user yo'q.`, { chat_id: chatId, message_id: loadMsg.message_id });
     }
 
-    // Progress xabari
-    const stMsg = await ctx.reply(`📤 Navbatga qo'shildi: 0/${targetUsers.length}\n⏳ Broadcast background'da ishlaydi...`)
+    const PAGE_SIZE = 20;
+    let msg = `${SITE_LABELS[site]} *— USERLAR RO'YXATI*\n`;
+    msg += `📊 Jami: *${leads.length}* ta\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
 
-    // Navbatga qo'shish — await YO'Q, bot bloklanmaydi!
-    broadcastQueue.push({
-      users:      targetUsers,
-      fromChatId: ctx.chat.id,
-      msgId:      ctx.message.message_id,
-      chatId:     ctx.chat.id,
-      stMsgId:    stMsg.message_id
-    })
-    runBroadcastQueue() // fire-and-forget
+    const pageLeads = leads.slice(0, PAGE_SIZE);
+    pageLeads.forEach((l, i) => {
+      msg += `*${i + 1}.* ${l.full_name || 'Ism yo\'q'}\n`;
+      msg += `📞 ${l.phone_number || 'Tel yo\'q'}\n`;
+      msg += `📅 ${formatDate(l.created_at)}\n\n`;
+    });
 
-    delete adminState[uid]
-    return ctx.reply(`✅ Broadcast boshlandi!\nBot bloklanmaydi — boshqalar /start bosa oladi.\n📊 Progressni yuqoridagi xabarda kuzating.`, adminKeyboard())
+    if (leads.length > PAGE_SIZE) {
+      msg += `_Faqat birinchi ${PAGE_SIZE} ta ko'rsatildi. To'liq uchun Excel yuklab oling._ ⬇️`;
+    }
+
+    bot.editMessageText(msg, {
+      chat_id: chatId,
+      message_id: loadMsg.message_id,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('handleWebinarBySite:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
   }
-})
+}
 
-// ===== GLOBAL XATO TUTISH =====
-bot.catch((err, ctx) => {
-  console.error('Bot xatosi:', err?.message || err)
-  // foydalanuvchiga xabar bermaslik — shunchaki log
-})
+async function handleWebinarExcel(chatId, type) {
+  try {
+    const loadMsg = await bot.sendMessage(chatId, '⏳ Excel fayl yaratilmoqda...');
+    const leads = await getWebinarLeads();
 
-// ===== ISHGA TUSHIRISH =====
-bot.launch({ dropPendingUpdates: true }).then(() => {
-  console.log('🚀 BOT ISHLAYAPTI')
-  console.log(`👤 Login: ${ADMIN_LOGIN}  🔐 Parol: ${ADMIN_PASSWORD}`)
-  console.log(`📁 Baza: ${USERS_CSV}`)
-  console.log(`📡 Kanal: ${CHANNEL_ID} ga har ${EXCEL_INTERVAL_MINUTES} daqiqada Excel yuboriladi`)
-  console.log('✅ Kunlik hisobot taymeri ishlamoqda')
-})
-process.once('SIGINT',  () => bot.stop('SIGINT'))
-process.once('SIGTERM', () => bot.stop('SIGTERM'))
+    if (leads.length === 0) {
+      return bot.editMessageText('📭 Webinarda hali user yo\'q.', { chat_id: chatId, message_id: loadMsg.message_id });
+    }
+
+    const ts = Date.now();
+    const filePath = await createWebinarExcel(leads, `webinar_${type}_${ts}.xlsx`);
+
+    const siteCounts = {};
+    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    leads.forEach(l => {
+      const s = (l.type || '').toLowerCase();
+      if (SITE_KEYS.includes(s)) siteCounts[s]++;
+    });
+
+    const siteStr = SITE_KEYS.map(s => `${SITE_LABELS[s]}: ${siteCounts[s]}`).join('\n');
+
+    await bot.deleteMessage(chatId, loadMsg.message_id);
+    await bot.sendDocument(chatId, filePath, {
+      caption: `🎯 *Webinar Leads*\n📊 Jami: ${leads.length} ta\n\n${siteStr}\n\n📅 ${formatDate(new Date().toISOString())}`,
+      parse_mode: 'Markdown',
+    });
+    deleteFile(filePath);
+  } catch (err) {
+    console.error('handleWebinarExcel:', err);
+    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+  }
+}
+
+// ========================
+// AVTOMATIK 10 DAQIQALIK XABAR
+// ========================
+
+async function sendAutoReport() {
+  if (!CHANNEL_ID || CHANNEL_ID === 'YOUR_CHANNEL_ID_HERE') {
+    console.log('⚠️  CHANNEL_ID sozlanmagan, avtomatik xabar o\'tkazib yuborildi.');
+    return;
+  }
+
+  try {
+    const [webinarLeads, huzurLeads] = await Promise.all([
+      getWebinarLeads(),
+      getHuzurLeads(),
+    ]);
+
+    const siteCounts = {};
+    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    webinarLeads.forEach(l => {
+      const s = (l.type || '').toLowerCase();
+      if (SITE_KEYS.includes(s)) siteCounts[s]++;
+    });
+
+    const now = formatDate(new Date().toISOString());
+    const todayStr = formatDateOnly(new Date().toISOString());
+
+    const todayWebinar = webinarLeads.filter(l => formatDateOnly(l.created_at) === todayStr);
+    const todayHuzur = huzurLeads.filter(l => formatDateOnly(l.created_at) === todayStr);
+
+    let msg = `🤖 *AVTOMATIK HISOBOT*\n`;
+    msg += `🕐 ${now}\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    msg += `🎯 *WEBINAR*\n`;
+    msg += `👥 Jami: *${webinarLeads.length}* ta\n`;
+    SITE_KEYS.forEach(s => {
+      msg += `${SITE_LABELS[s]}: ${siteCounts[s]} ta\n`;
+    });
+    msg += `📅 Bugun (${todayStr}): *${todayWebinar.length}* ta\n\n`;
+
+    msg += `📚 *HUZUR KURSI*\n`;
+    msg += `👥 Jami: *${huzurLeads.length}* ta\n`;
+    msg += `📅 Bugun (${todayStr}): *${todayHuzur.length}* ta\n`;
+    msg += `━━━━━━━━━━━━━━━━━━━━\n`;
+    msg += `🔄 _Keyingi yangilanish 10 daqiqadan so'ng_`;
+
+    await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
+    console.log(`✅ Avtomatik hisobot yuborildi: ${now}`);
+  } catch (err) {
+    console.error('❌ Avtomatik hisobot xatosi:', err.message);
+  }
+}
+
+// Har 10 daqiqada ishga tushadi
+cron.schedule('*/10 * * * *', () => {
+  console.log('⏰ Avtomatik hisobot yuborilmoqda...');
+  sendAutoReport();
+});
+
+// ========================
+// XATO USHLASH
+// ========================
+bot.on('polling_error', (error) => {
+  console.error('Polling xato:', error.code, error.message);
+});
+
+bot.on('error', (error) => {
+  console.error('Bot xato:', error.message);
+});
+
+// ========================
+// START
+// ========================
+console.log('🚀 Bot ishga tushdi!');
+console.log('📊 Supabase ulandi:', SUPABASE_URL);
+console.log('🔄 Har 10 daqiqada avtomatik hisobot yuboriladi');
+console.log('💡 Kanal ID:', CHANNEL_ID);
+sendAutoReport(); // Botni ishga tushirganda darhol bir marta yuboradi
