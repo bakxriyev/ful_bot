@@ -641,6 +641,7 @@ async function handleWebinarExcel(chatId, type) {
 // ========================
 
 async function sendAutoReport() {
+  let excelPath = null;
   try {
     const [webinarLeads, huzurLeads] = await Promise.all([
       getWebinarLeads(),
@@ -660,6 +661,7 @@ async function sendAutoReport() {
     const todayWebinar = webinarLeads.filter(l => formatDateOnly(l.created_at) === todayStr);
     const todayHuzur   = huzurLeads.filter(l   => formatDateOnly(l.created_at) === todayStr);
 
+    // 1) Matnli hisobot xabari
     let msg = `🤖 *AVTOMATIK HISOBOT*\n`;
     msg += `🕐 ${nowStr} (UZT)\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
@@ -673,11 +675,25 @@ async function sendAutoReport() {
     msg += `👥 Jami: *${huzurLeads.length}* ta\n`;
     msg += `📅 Bugun (${todayStr}): *${todayHuzur.length}* ta\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-    msg += `🔄 _Keyingi yangilanish 10 daqiqadan so'ng_`;
+    msg += `📎 _Quyida webinar to'liq bazasi (Excel)_`;
 
     await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
-    console.log(`✅ Avtomatik hisobot yuborildi: ${nowStr}`);
+
+    // 2) Webinar barcha userlar — Excel fayl
+    if (webinarLeads.length > 0) {
+      const siteStr   = SITE_KEYS.map(s => `${SITE_LABELS[s]}: ${siteCounts[s]}`).join(' | ');
+      excelPath = await createWebinarExcel(webinarLeads, `auto_webinar_${Date.now()}.xlsx`);
+      await bot.sendDocument(CHANNEL_ID, excelPath, {
+        caption: `📊 *WEBINAR — TO'LIQ BAZA*\n👥 Jami: ${webinarLeads.length} ta\n${siteStr}\n📅 ${nowStr} (UZT)`,
+        parse_mode: 'Markdown',
+      });
+      deleteFile(excelPath);
+      excelPath = null;
+    }
+
+    console.log(`✅ Avtomatik hisobot + Excel yuborildi: ${nowStr}`);
   } catch (err) {
+    if (excelPath) deleteFile(excelPath);
     console.error('❌ Avtomatik hisobot xatosi:', err.message);
   }
 }
