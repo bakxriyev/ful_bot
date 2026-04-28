@@ -9,19 +9,22 @@ const path = require('path');
 // ========================
 // KONFIGURATSIYA
 // ========================
-const BOT_TOKEN   = '8679225810:AAE-u-SX3esTae23LY09dYyAz_cgIPH4j_4';
-const CHANNEL_ID  = '-1003920803109';
+const BOT_TOKEN    = '8679225810:AAE-u-SX3esTae23LY09dYyAz_cgIPH4j_4';
+const CHANNEL_ID   = '-1003920803109';
 const SUPABASE_URL = 'https://vxpvgeyktgyasegvycfp.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_pXpHGuZFzmhJUD6FkQeapQ__7D78i4w';
 
-// O'zbekiston vaqt zonasi offset (UTC+5) — daqiqada
+// O'zbekiston UTC+5
 const UZT_OFFSET_MS = 5 * 60 * 60 * 1000;
 
 // ========================
 // INIT
 // ========================
-const bot      = new TelegramBot(BOT_TOKEN, { polling: true });
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  realtime: { params: { eventsPerSecond: 10 } },
+});
 
 const SITE_LABELS = { a: '🅰️ A Sayt', b: '🅱️ B Sayt', c: '🅾️ C Sayt', d: '🔷 D Sayt' };
 const SITE_KEYS   = ['a', 'b', 'c', 'd'];
@@ -31,13 +34,40 @@ const TEMP_DIR = path.join(__dirname, 'temp');
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
 // ========================
-// VAQT FUNKSIYALARI (UTC+5 — O'zbekiston)
+// VAQT FUNKSIYALARI
 // ========================
 
-// ISO string yoki Date -> UTC+5 da { year, month, day, hours, minutes }
+/**
+ * Supabase "2026-04-28 04:38:05.148+00" -> to'g'ri Date object
+ * Muammo: PostgreSQL space ishlatadi T orniga, +00 oxirida colon yoq.
+ * JS bunday formatni noto'g'ri parse qilishi mumkin.
+ */
+function parseSupabaseDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
+
+  let str = String(val).trim();
+
+  // "2026-04-28 04:38:05.148+00" -> "2026-04-28T04:38:05.148+00:00"
+  str = str.replace(' ', 'T');
+
+  // "+00" yoki "+05" oxirida colon yoq bolsa +00:00 ga otkazamiz
+  str = str.replace(/([+-]\d{2})$/, '$1:00');
+
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+
+  // Fallback
+  const d2 = new Date(val);
+  return isNaN(d2.getTime()) ? null : d2;
+}
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
 function toUZT(val) {
-  const utcMs = (val instanceof Date ? val : new Date(val)).getTime();
-  const uzt   = new Date(utcMs + UZT_OFFSET_MS);
+  const date = parseSupabaseDate(val);
+  if (!date) return { year: 0, month: 0, day: 0, hours: 0, minutes: 0 };
+  const uzt = new Date(date.getTime() + UZT_OFFSET_MS);
   return {
     year:    uzt.getUTCFullYear(),
     month:   uzt.getUTCMonth() + 1,
@@ -47,68 +77,158 @@ function toUZT(val) {
   };
 }
 
-function pad(n) { return String(n).padStart(2, '0'); }
-
-// "28.04.2026 00:30" (UZT)
-function formatDate(isoStr) {
-  if (!isoStr) return '';
-  const t = toUZT(isoStr);
+// "28.04.2026 09:38" (UZT)
+function formatDate(val) {
+  if (!val) return '—';
+  const t = toUZT(val);
+  if (!t.year) return '—';
   return `${pad(t.day)}.${pad(t.month)}.${t.year} ${pad(t.hours)}:${pad(t.minutes)}`;
 }
 
 // "28.04.2026" (UZT)
-function formatDateOnly(isoStr) {
-  if (!isoStr) return '';
-  const t = toUZT(isoStr);
+function formatDateOnly(val) {
+  if (!val) return '';
+  const t = toUZT(val);
+  if (!t.year) return '';
   return `${pad(t.day)}.${pad(t.month)}.${t.year}`;
 }
 
-// Hozirgi O'zbekiston vaqti "28.04.2026 00:30"
-function nowUZT() {
-  return formatDate(new Date().toISOString());
-}
+function nowUZT()   { return formatDate(new Date()); }
+function todayUZT() { return formatDateOnly(new Date()); }
 
-// Hozirgi O'zbekiston sanasi "28.04.2026"
-function todayUZT() {
-  return formatDateOnly(new Date().toISOString());
-}
-
-// Saralash uchun: "28.04.2026" -> "2026.04.28"
+// Saralash: "28.04.2026" -> "2026.04.28"
 function sortableDate(ddmmyyyy) {
+  if (!ddmmyyyy) return '';
   return ddmmyyyy.split('.').reverse().join('.');
 }
 
+function lastNDaysUZT(n) {
+  const days  = [];
+  const nowMs = Date.now() + UZT_OFFSET_MS;
+  for (let i = n - 1; i >= 0; i--) {
+    const d = new Date(nowMs - i * 86400000);
+    days.push(`${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`);
+  }
+  return days;
+}
+
 // ========================
-// SUPABASE FUNKSIYALAR
+// SUPABASE — BARCHA QATORLARNI OLISH (pagination)
+// Supabase default 1000 qator cheklovi bor.
+// .range() bilan sahifalab HAMMA qatorlarni olamiz.
 // ========================
 
+async function fetchAllRows(tableName, filters = [], orderColumn = 'created_at', ascending = false) {
+  const PAGE_SIZE = 1000;
+  let allData     = [];
+  let from        = 0;
+
+  while (true) {
+    let query = supabase
+      .from(tableName)
+      .select('*')
+      .order(orderColumn, { ascending })
+      .range(from, from + PAGE_SIZE - 1);
+
+    for (const f of filters) {
+      query = query.eq(f.column, f.value);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw new Error(`${tableName} fetchAllRows xatosi: ${error.message}`);
+    if (!data || data.length === 0) break;
+
+    allData = allData.concat(data);
+    console.log(`📥 ${tableName}: ${allData.length} ta olindi (sahifa: ${from}–${from + data.length - 1})`);
+
+    // Agar qaytgan data PAGE_SIZE dan kam bo'lsa — oxirgi sahifa
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return allData;
+}
+
+// Webinar — barcha leadlar
 async function getWebinarLeads() {
-  const { data, error } = await supabase
-    .from('leads')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) throw new Error(`Webinar leads xatosi: ${error.message}`);
-  return data || [];
+  return fetchAllRows('leads', [], 'created_at', false);
 }
 
+// Huzur — barcha leadlar (pagination bilan HAMMASI)
 async function getHuzurLeads() {
-  const { data, error } = await supabase
-    .from('huzur')
-    .select('*')
-    .order('created_at', { ascending: false });
-  if (error) throw new Error(`Huzur leads xatosi: ${error.message}`);
-  return data || [];
+  return fetchAllRows('huzur', [], 'created_at', false);
 }
 
+// Webinar — bitta sayt bo'yicha
 async function getWebinarBySite(site) {
-  const { data, error } = await supabase
-    .from('leads')
-    .select('*')
-    .eq('type', site)
-    .order('created_at', { ascending: false });
-  if (error) throw new Error(`Webinar site xatosi: ${error.message}`);
-  return data || [];
+  return fetchAllRows('leads', [{ column: 'type', value: site }], 'created_at', false);
 }
+
+// ========================
+// REAL-TIME SUBSCRIPTIONS
+// ========================
+
+// Webinar jadvaliga yangi qator qoshilganda kanal xabari
+supabase
+  .channel('leads-realtime')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'leads' },
+    async (payload) => {
+      try {
+        const l    = payload.new;
+        const site = (l.type || '').toUpperCase();
+        const time = formatDate(l.created_at);
+
+        const msg =
+          `🔔 *YANGI WEBINAR LEAD!*\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `👤 Ism: *${l.full_name    || "Ism yo'q"}*\n` +
+          `📞 Tel: \`${l.phone_number || "Tel yo'q"}\`\n` +
+          `🌐 Sayt: *${site || '—'}*\n` +
+          `📅 Vaqt: ${time} (UZT)`;
+
+        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
+        console.log(`✅ Yangi webinar lead: ${l.full_name} [${site}] — ${time}`);
+      } catch (err) {
+        console.error('❌ Webinar real-time xabari xatosi:', err.message);
+      }
+    }
+  )
+  .subscribe((status) => {
+    console.log('📡 Webinar real-time status:', status);
+  });
+
+// Huzur jadvaliga yangi qator qoshilganda kanal xabari
+supabase
+  .channel('huzur-realtime')
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'huzur' },
+    async (payload) => {
+      try {
+        const l    = payload.new;
+        const time = formatDate(l.created_at);
+
+        const msg =
+          `🔔 *YANGI HUZUR KURSI LEAD!*\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `👤 Ism: *${l.full_name    || "Ism yo'q"}*\n` +
+          `📞 Tel: \`${l.phone_number || "Tel yo'q"}\`\n` +
+          `📍 Manzil: ${l.address    || "Manzil yo'q"}\n` +
+          `📅 Vaqt: ${time} (UZT)`;
+
+        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
+        console.log(`✅ Yangi huzur lead: ${l.full_name} — ${time}`);
+      } catch (err) {
+        console.error('❌ Huzur real-time xabari xatosi:', err.message);
+      }
+    }
+  )
+  .subscribe((status) => {
+    console.log('📡 Huzur real-time status:', status);
+  });
 
 // ========================
 // EXCEL YARATUVCHI FUNKSIYALAR
@@ -140,7 +260,7 @@ async function createWebinarExcel(leads, filename = 'webinar_leads.xlsx') {
   });
   autoStyle(wsAll);
 
-  // Sheet 2-5: Har bir sayt bo'yicha
+  // Sheet 2–5: Har bir sayt
   for (const site of SITE_KEYS) {
     const siteLeads = leads.filter(l => (l.type || '').toLowerCase() === site);
     const ws = wb.addWorksheet(`${site.toUpperCase()} Sayt`);
@@ -217,7 +337,8 @@ async function createHuzurExcel(leads, filename = 'huzur_leads.xlsx') {
 
   const dailyMap = {};
   leads.forEach(l => {
-    const d = formatDateOnly(l.created_at); // UZT
+    const d = formatDateOnly(l.created_at);
+    if (!d) return;
     dailyMap[d] = (dailyMap[d] || 0) + 1;
   });
   Object.entries(dailyMap)
@@ -264,7 +385,8 @@ function autoStyle(ws) {
 function getDailyStats(leads) {
   const map = {};
   leads.forEach(l => {
-    const d    = formatDateOnly(l.created_at); // UZT sana
+    const d    = formatDateOnly(l.created_at);
+    if (!d) return;
     const site = (l.type || 'unknown').toLowerCase();
     if (!map[d]) map[d] = { date: d, a: 0, b: 0, c: 0, d: 0, total: 0 };
     if (SITE_KEYS.includes(site)) map[d][site]++;
@@ -279,16 +401,6 @@ function deleteFile(filePath) {
   try { fs.unlinkSync(filePath); } catch {}
 }
 
-// So'nggi N kunning UZT sanalarini qaytaradi ["28.04.2026", ...]
-function lastNDaysUZT(n) {
-  const days = [];
-  for (let i = n - 1; i >= 0; i--) {
-    const d = new Date(Date.now() + UZT_OFFSET_MS - i * 86400000);
-    days.push(`${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`);
-  }
-  return days;
-}
-
 // ========================
 // KLAVIATURA MENULARI
 // ========================
@@ -300,7 +412,7 @@ const mainMenu = {
     ],
     resize_keyboard: true,
     one_time_keyboard: false,
-  }
+  },
 };
 
 const webinarMenu = {
@@ -313,7 +425,7 @@ const webinarMenu = {
       ['🏠 Bosh Menu'],
     ],
     resize_keyboard: true,
-  }
+  },
 };
 
 const huzurMenu = {
@@ -324,7 +436,7 @@ const huzurMenu = {
       ['🏠 Bosh Menu'],
     ],
     resize_keyboard: true,
-  }
+  },
 };
 
 // ========================
@@ -339,8 +451,9 @@ const userState = {};
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   userState[chatId] = 'main';
-  bot.sendMessage(chatId,
-    `👋 *Assalomu alaykum!*\n\nBu bot Supabase bazasidagi ma'lumotlarni ko'rish va Excel yuklab olish uchun yaratilgan.\n\n🕐 Barcha vaqtlar *O'zbekiston vaqti (UTC+5)* da ko'rsatiladi.\n\n*Quyidagi bo'limlardan birini tanlang:*`,
+  bot.sendMessage(
+    chatId,
+    `👋 *Assalomu alaykum!*\n\nBu bot Supabase bazasidagi ma'lumotlarni ko'rish va Excel yuklab olish uchun yaratilgan.\n\n🕐 Barcha vaqtlar *O'zbekiston vaqti (UTC+5)* da ko'rsatiladi.\n📡 *Real-time* yangilanishlar yoqilgan!\n\n*Bo'limni tanlang:*`,
     { parse_mode: 'Markdown', ...mainMenu }
   );
 });
@@ -391,19 +504,31 @@ bot.on('message', async (msg) => {
 // ========================
 
 async function handleHuzurAllUsers(chatId) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, "⏳ Ma'lumotlar yuklanmoqda...");
-    const leads   = await getHuzurLeads();
+    loadMsg = await bot.sendMessage(
+      chatId,
+      "⏳ *Barcha ma'lumotlar yuklanmoqda...*\n_(Jami userlar ko'p bo'lsa biroz vaqt ketishi mumkin)_",
+      { parse_mode: 'Markdown' }
+    );
+
+    // Pagination bilan BARCHA huzur userlarini olamiz
+    const leads = await getHuzurLeads();
 
     if (leads.length === 0) {
-      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
     const PAGE_SIZE  = 20;
     const totalPages = Math.ceil(leads.length / PAGE_SIZE);
+    const todayStr   = todayUZT();
+    const todayCount = leads.filter(l => formatDateOnly(l.created_at) === todayStr).length;
 
     let msg = `📚 *HUZUR KURSI — BARCHA USERLAR*\n`;
     msg += `📊 Jami: *${leads.length}* ta\n`;
+    msg += `📅 Bugun (${todayStr}): *${todayCount}* ta\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
 
     leads.slice(0, PAGE_SIZE).forEach((l, i) => {
@@ -414,70 +539,115 @@ async function handleHuzurAllUsers(chatId) {
     });
 
     if (totalPages > 1) {
-      msg += `\n_Sahifa 1/${totalPages} — faqat birinchi ${PAGE_SIZE} ta ko'rsatildi_\n`;
-      msg += `_To'liq ro'yxat uchun Excel yuklab oling_ ⬇️`;
+      msg += `_Sahifa 1/${totalPages} — faqat birinchi ${PAGE_SIZE} ta ko'rsatildi_\n`;
+      msg += `_To'liq ro'yxat uchun 📥 Excel yuklab oling_ ⬇️`;
     }
 
-    bot.editMessageText(msg, { chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown' });
+    await bot.editMessageText(msg, {
+      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
+    });
   } catch (err) {
     console.error('handleHuzurAllUsers:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    loadMsg
+      ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+      : bot.sendMessage(chatId, errMsg);
   }
 }
 
 async function handleHuzurDailyStats(chatId) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
-    const leads   = await getHuzurLeads();
+    loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
+
+    // Pagination bilan BARCHA huzur userlarini olamiz
+    const leads = await getHuzurLeads();
 
     if (leads.length === 0) {
-      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
     // UZT bo'yicha kunlik hisob
     const dailyMap = {};
     leads.forEach(l => {
       const d = formatDateOnly(l.created_at);
+      if (!d) return;
       dailyMap[d] = (dailyMap[d] || 0) + 1;
     });
 
     const sorted = Object.entries(dailyMap)
       .sort((a, b) => sortableDate(a[0]).localeCompare(sortableDate(b[0])));
 
+    const maxCount = Math.max(...Object.values(dailyMap), 1);
+
     let msg = `📚 *HUZUR KURSI — KUNLIK STATISTIKA*\n`;
+    msg += `📊 Jami: *${leads.length}* ta\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
     sorted.forEach(([date, count]) => {
-      msg += `📅 *${date}* — ${count} ta user\n`;
+      const bar = '▓'.repeat(Math.round((count / maxCount) * 10));
+      msg += `📅 *${date}* — ${count} ta ${bar}\n`;
     });
+
     msg += `━━━━━━━━━━━━━━━━━━━━\n`;
     msg += `📊 *Jami: ${leads.length} ta*`;
 
-    bot.editMessageText(msg, { chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown' });
+    await bot.editMessageText(msg, {
+      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
+    });
   } catch (err) {
     console.error('handleHuzurDailyStats:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    loadMsg
+      ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+      : bot.sendMessage(chatId, errMsg);
   }
 }
 
 async function handleHuzurExcel(chatId) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, '⏳ Excel fayl yaratilmoqda...');
-    const leads   = await getHuzurLeads();
+    loadMsg = await bot.sendMessage(
+      chatId,
+      "⏳ *Excel fayl yaratilmoqda...*\n_(Barcha ma'lumotlar yuklanmoqda)_",
+      { parse_mode: 'Markdown' }
+    );
+
+    // Pagination bilan BARCHA huzur userlarini olamiz
+    const leads = await getHuzurLeads();
 
     if (leads.length === 0) {
-      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText("📭 Huzur kursida hali user yo'q.", {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
-    const filePath = await createHuzurExcel(leads, `huzur_${Date.now()}.xlsx`);
+    const filePath   = await createHuzurExcel(leads, `huzur_${Date.now()}.xlsx`);
+    const todayStr   = todayUZT();
+    const todayCount = leads.filter(l => formatDateOnly(l.created_at) === todayStr).length;
+
     await bot.deleteMessage(chatId, loadMsg.message_id);
     await bot.sendDocument(chatId, filePath, {
-      caption: `📚 *Huzur Kursi*\n📊 Jami: ${leads.length} ta user\n📅 ${nowUZT()} (UZT)`,
+      caption:
+        `📚 *Huzur Kursi — To'liq Baza*\n` +
+        `📊 Jami: *${leads.length}* ta user\n` +
+        `📅 Bugun (${todayStr}): *${todayCount}* ta\n` +
+        `🕐 ${nowUZT()} (UZT)`,
       parse_mode: 'Markdown',
     });
     deleteFile(filePath);
   } catch (err) {
     console.error('handleHuzurExcel:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    try {
+      loadMsg
+        ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+        : bot.sendMessage(chatId, errMsg);
+    } catch (_) {
+      bot.sendMessage(chatId, errMsg);
+    }
   }
 }
 
@@ -486,54 +656,69 @@ async function handleHuzurExcel(chatId) {
 // ========================
 
 async function handleWebinarAllUsers(chatId) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, "⏳ Ma'lumotlar yuklanmoqda...");
-    const leads   = await getWebinarLeads();
+    loadMsg = await bot.sendMessage(chatId, "⏳ Barcha ma'lumotlar yuklanmoqda...");
+
+    const leads = await getWebinarLeads();
 
     if (leads.length === 0) {
-      return bot.editMessageText("📭 Webinarda hali user yo'q.", { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText("📭 Webinarda hali user yo'q.", {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
     const PAGE_SIZE  = 20;
     const totalPages = Math.ceil(leads.length / PAGE_SIZE);
     const siteCounts = {};
-    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    SITE_KEYS.forEach(s => (siteCounts[s] = 0));
     leads.forEach(l => {
       const s = (l.type || '').toLowerCase();
       if (SITE_KEYS.includes(s)) siteCounts[s]++;
     });
 
+    const todayStr   = todayUZT();
+    const todayCount = leads.filter(l => formatDateOnly(l.created_at) === todayStr).length;
+
     let msg = `🎯 *WEBINAR — BARCHA USERLAR*\n`;
     msg += `📊 Jami: *${leads.length}* ta\n`;
+    msg += `📅 Bugun (${todayStr}): *${todayCount}* ta\n`;
     SITE_KEYS.forEach(s => { msg += `${SITE_LABELS[s]}: ${siteCounts[s]} ta\n`; });
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
 
     leads.slice(0, PAGE_SIZE).forEach((l, i) => {
       msg += `*${i + 1}.* ${l.full_name    || "Ism yo'q"}\n`;
       msg += `📞 ${l.phone_number || "Tel yo'q"}\n`;
-      msg += `🌐 Sayt: *${(l.type || '-').toUpperCase()}*\n`;
+      msg += `🌐 Sayt: *${(l.type || '—').toUpperCase()}*\n`;
       msg += `📅 ${formatDate(l.created_at)}\n\n`;
     });
 
     if (totalPages > 1) {
       msg += `_Sahifa 1/${totalPages} — faqat birinchi ${PAGE_SIZE} ta_\n`;
-      msg += `_To'liq ro'yxat uchun Excel yuklab oling_ ⬇️`;
+      msg += `_To'liq ro'yxat uchun 📥 Excel yuklab oling_ ⬇️`;
     }
 
-    bot.editMessageText(msg, { chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown' });
+    await bot.editMessageText(msg, {
+      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
+    });
   } catch (err) {
     console.error('handleWebinarAllUsers:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    loadMsg
+      ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+      : bot.sendMessage(chatId, errMsg);
   }
 }
 
 async function handleWebinarStats(chatId) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
-    const leads   = await getWebinarLeads();
+    loadMsg = await bot.sendMessage(chatId, '⏳ Statistika hisoblanmoqda...');
+
+    const leads = await getWebinarLeads();
 
     const siteCounts = {};
-    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    SITE_KEYS.forEach(s => (siteCounts[s] = 0));
     leads.forEach(l => {
       const s = (l.type || '').toLowerCase();
       if (SITE_KEYS.includes(s)) siteCounts[s]++;
@@ -550,14 +735,13 @@ async function handleWebinarStats(chatId) {
       msg += `${SITE_LABELS[s]}: *${count}* ta (${percent}%) ${bar}\n`;
     });
 
-    // So'nggi 7 kun (UZT bo'yicha)
     const last7 = lastNDaysUZT(7);
     msg += `\n*So'nggi 7 kunlik:*\n`;
     last7.forEach(date => {
       const dayLeads = leads.filter(l => formatDateOnly(l.created_at) === date);
       if (dayLeads.length > 0) {
         const bySite = {};
-        SITE_KEYS.forEach(s => bySite[s] = 0);
+        SITE_KEYS.forEach(s => (bySite[s] = 0));
         dayLeads.forEach(l => {
           const s = (l.type || '').toLowerCase();
           if (SITE_KEYS.includes(s)) bySite[s]++;
@@ -567,20 +751,29 @@ async function handleWebinarStats(chatId) {
       }
     });
 
-    bot.editMessageText(msg, { chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown' });
+    await bot.editMessageText(msg, {
+      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
+    });
   } catch (err) {
     console.error('handleWebinarStats:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    loadMsg
+      ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+      : bot.sendMessage(chatId, errMsg);
   }
 }
 
 async function handleWebinarBySite(chatId, site) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, `⏳ ${SITE_LABELS[site]} ma'lumotlari yuklanmoqda...`);
-    const leads   = await getWebinarBySite(site);
+    loadMsg = await bot.sendMessage(chatId, `⏳ ${SITE_LABELS[site]} ma'lumotlari yuklanmoqda...`);
+
+    const leads = await getWebinarBySite(site);
 
     if (leads.length === 0) {
-      return bot.editMessageText(`📭 ${SITE_LABELS[site]} da hali user yo'q.`, { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText(`📭 ${SITE_LABELS[site]} da hali user yo'q.`, {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
     const PAGE_SIZE = 20;
@@ -598,26 +791,34 @@ async function handleWebinarBySite(chatId, site) {
       msg += `_Faqat birinchi ${PAGE_SIZE} ta ko'rsatildi. To'liq uchun Excel yuklab oling._ ⬇️`;
     }
 
-    bot.editMessageText(msg, { chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown' });
+    await bot.editMessageText(msg, {
+      chat_id: chatId, message_id: loadMsg.message_id, parse_mode: 'Markdown',
+    });
   } catch (err) {
     console.error('handleWebinarBySite:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    loadMsg
+      ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+      : bot.sendMessage(chatId, errMsg);
   }
 }
 
 async function handleWebinarExcel(chatId, type) {
+  let loadMsg;
   try {
-    const loadMsg = await bot.sendMessage(chatId, '⏳ Excel fayl yaratilmoqda...');
-    const leads   = await getWebinarLeads();
+    loadMsg = await bot.sendMessage(chatId, '⏳ Excel fayl yaratilmoqda...');
+
+    const leads = await getWebinarLeads();
 
     if (leads.length === 0) {
-      return bot.editMessageText("📭 Webinarda hali user yo'q.", { chat_id: chatId, message_id: loadMsg.message_id });
+      return bot.editMessageText("📭 Webinarda hali user yo'q.", {
+        chat_id: chatId, message_id: loadMsg.message_id,
+      });
     }
 
-    const filePath = await createWebinarExcel(leads, `webinar_${type}_${Date.now()}.xlsx`);
-
+    const filePath   = await createWebinarExcel(leads, `webinar_${type}_${Date.now()}.xlsx`);
     const siteCounts = {};
-    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    SITE_KEYS.forEach(s => (siteCounts[s] = 0));
     leads.forEach(l => {
       const s = (l.type || '').toLowerCase();
       if (SITE_KEYS.includes(s)) siteCounts[s]++;
@@ -626,30 +827,42 @@ async function handleWebinarExcel(chatId, type) {
 
     await bot.deleteMessage(chatId, loadMsg.message_id);
     await bot.sendDocument(chatId, filePath, {
-      caption: `🎯 *Webinar Leads*\n📊 Jami: ${leads.length} ta\n\n${siteStr}\n\n📅 ${nowUZT()} (UZT)`,
+      caption:
+        `🎯 *Webinar Leads — To'liq Baza*\n` +
+        `📊 Jami: *${leads.length}* ta\n\n` +
+        `${siteStr}\n\n` +
+        `📅 ${nowUZT()} (UZT)`,
       parse_mode: 'Markdown',
     });
     deleteFile(filePath);
   } catch (err) {
     console.error('handleWebinarExcel:', err);
-    bot.sendMessage(chatId, `❌ Xato: ${err.message}`);
+    const errMsg = `❌ Xato: ${err.message}`;
+    try {
+      loadMsg
+        ? bot.editMessageText(errMsg, { chat_id: chatId, message_id: loadMsg.message_id })
+        : bot.sendMessage(chatId, errMsg);
+    } catch (_) {
+      bot.sendMessage(chatId, errMsg);
+    }
   }
 }
 
 // ========================
-// AVTOMATIK 10 DAQIQALIK XABAR
+// AVTOMATIK 10 DAQIQALIK HISOBOT
 // ========================
 
 async function sendAutoReport() {
   let excelPath = null;
   try {
+    // Ikkala jadvaldan ham BARCHA qatorlarni olamiz
     const [webinarLeads, huzurLeads] = await Promise.all([
       getWebinarLeads(),
       getHuzurLeads(),
     ]);
 
     const siteCounts = {};
-    SITE_KEYS.forEach(s => siteCounts[s] = 0);
+    SITE_KEYS.forEach(s => (siteCounts[s] = 0));
     webinarLeads.forEach(l => {
       const s = (l.type || '').toLowerCase();
       if (SITE_KEYS.includes(s)) siteCounts[s]++;
@@ -661,7 +874,6 @@ async function sendAutoReport() {
     const todayWebinar = webinarLeads.filter(l => formatDateOnly(l.created_at) === todayStr);
     const todayHuzur   = huzurLeads.filter(l   => formatDateOnly(l.created_at) === todayStr);
 
-    // 1) Matnli hisobot xabari
     let msg = `🤖 *AVTOMATIK HISOBOT*\n`;
     msg += `🕐 ${nowStr} (UZT)\n`;
     msg += `━━━━━━━━━━━━━━━━━━━━\n\n`;
@@ -679,19 +891,22 @@ async function sendAutoReport() {
 
     await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
 
-    // 2) Webinar barcha userlar — Excel fayl
     if (webinarLeads.length > 0) {
-      const siteStr   = SITE_KEYS.map(s => `${SITE_LABELS[s]}: ${siteCounts[s]}`).join(' | ');
+      const siteStr = SITE_KEYS.map(s => `${SITE_LABELS[s]}: ${siteCounts[s]}`).join(' | ');
       excelPath = await createWebinarExcel(webinarLeads, `auto_webinar_${Date.now()}.xlsx`);
       await bot.sendDocument(CHANNEL_ID, excelPath, {
-        caption: `📊 *WEBINAR — TO'LIQ BAZA*\n👥 Jami: ${webinarLeads.length} ta\n${siteStr}\n📅 ${nowStr} (UZT)`,
+        caption:
+          `📊 *WEBINAR — TO'LIQ BAZA*\n` +
+          `👥 Jami: ${webinarLeads.length} ta\n` +
+          `${siteStr}\n` +
+          `📅 ${nowStr} (UZT)`,
         parse_mode: 'Markdown',
       });
       deleteFile(excelPath);
       excelPath = null;
     }
 
-    console.log(`✅ Avtomatik hisobot + Excel yuborildi: ${nowStr}`);
+    console.log(`✅ Avtomatik hisobot yuborildi: ${nowStr}`);
   } catch (err) {
     if (excelPath) deleteFile(excelPath);
     console.error('❌ Avtomatik hisobot xatosi:', err.message);
@@ -721,5 +936,6 @@ console.log('🚀 Bot ishga tushdi!');
 console.log('📊 Supabase:', SUPABASE_URL);
 console.log("🕐 Vaqt zonasi: UTC+5 (O'zbekiston)");
 console.log('🔄 Har 10 daqiqada avtomatik hisobot');
-console.log('💡 Kanal ID:', CHANNEL_ID);
+console.log('📡 Real-time: leads + huzur jadvallar kuzatilmoqda');
+
 sendAutoReport();
