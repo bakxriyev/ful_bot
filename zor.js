@@ -9,7 +9,7 @@ const path = require('path');
 // ========================
 // KONFIGURATSIYA
 // ========================
-const BOT_TOKEN    = '8679225810:AAG-wo6seWBQTAxBkfb0rD1c0L0Kdul49fE';
+const BOT_TOKEN    = '8222835015:AAHwuKdwz_xflfMd7RuuGACL1O8B77Woi7k';
 const CHANNEL_ID   = '-1003920803109';
 const SUPABASE_URL = 'https://vxpvgeyktgyasegvycfp.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_pXpHGuZFzmhJUD6FkQeapQ__7D78i4w';
